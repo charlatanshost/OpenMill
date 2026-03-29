@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use crate::kinematics::MachineConfig;
 use crate::model::WorkpieceModel;
@@ -14,7 +15,8 @@ use super::traits::ToolpathStrategy;
 pub struct SurfaceNormal5Axis;
 
 /// Drive-surface scan pattern.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DrivePattern {
     /// Parallel raster passes along the surface U parameter.
     Parallel,
@@ -25,7 +27,7 @@ pub enum DrivePattern {
 }
 
 /// Tuning parameters for [`SurfaceNormal5Axis`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SurfaceNormal5AxisParams {
     /// Lead angle (tilt in direction of motion) [degrees].
     pub lead_angle: f64,

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use crate::kinematics::MachineConfig;
 use crate::model::WorkpieceModel;
@@ -14,7 +15,7 @@ use super::traits::ToolpathStrategy;
 pub struct ContourParallel;
 
 /// Tuning parameters for [`ContourParallel`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContourParallelParams {
     /// Step-down between waterline passes [mm].
     pub step_down: f64,

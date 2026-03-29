@@ -1,4 +1,5 @@
 use nalgebra::{Unit, Vector3};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Angular threshold below which sin(A) is considered degenerate.
@@ -8,9 +9,10 @@ pub const SINGULARITY_THRESHOLD: f64 = 1e-9;
 // ── Axis configuration ────────────────────────────────────────────────────────
 
 /// Configuration of a single rotary axis.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RotaryAxis {
     /// Physical rotation axis direction in machine coordinates.
+    #[serde(with = "unit_vector_serde")]
     pub axis_vector: Unit<Vector3<f64>>,
     /// Minimum travel limit [radians].
     pub min_angle: f64,
@@ -23,7 +25,8 @@ pub struct RotaryAxis {
 // ── Kinematic topology ────────────────────────────────────────────────────────
 
 /// Supported kinematic topologies.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub enum KinematicType {
     /// A-C table-table trunnion.
     ///
@@ -40,7 +43,7 @@ pub enum KinematicType {
 // ── Linear travel limits ──────────────────────────────────────────────────────
 
 /// Axis-aligned linear travel limits [mm].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AxisLimits {
     pub x: (f64, f64),
     pub y: (f64, f64),
@@ -50,7 +53,7 @@ pub struct AxisLimits {
 // ── Machine configuration ─────────────────────────────────────────────────────
 
 /// Complete machine configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineConfig {
     pub name: String,
     /// Kinematic topology and rotary axis parameters.
@@ -62,6 +65,22 @@ pub struct MachineConfig {
     pub pivot_offset: Vector3<f64>,
     /// Linear axis travel limits [mm].
     pub travel_limits: AxisLimits,
+}
+
+// ── Serde helper for Unit<Vector3<f64>> ──────────────────────────────────────
+
+mod unit_vector_serde {
+    use nalgebra::{Unit, Vector3};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Unit<Vector3<f64>>, s: S) -> Result<S::Ok, S::Error> {
+        v.as_ref().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Unit<Vector3<f64>>, D::Error> {
+        let v = Vector3::<f64>::deserialize(d)?;
+        Ok(Unit::new_normalize(v))
+    }
 }
 
 // ── IK error type ─────────────────────────────────────────────────────────────

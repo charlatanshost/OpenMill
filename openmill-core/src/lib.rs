@@ -1,24 +1,27 @@
+pub mod fixture;
 pub mod import;
+pub mod job;
 pub mod kinematics;
+pub mod material;
 pub mod model;
 pub mod strategies;
 pub mod tool;
 pub mod toolpath;
 
 // Flat re-exports for convenience.
+pub use fixture::{Fixture, FixtureShape};
+pub use import::{import_3mf, import_stl};
+pub use job::{Job, JobSettings, Operation, StockDef};
 pub use kinematics::{
     AxisLimits, ForwardKinematics, IkError, InverseKinematics, KinematicType, MachineConfig,
     RotaryAxis, TableTable,
 };
+pub use material::{Material, MaterialCategory, MaterialLibrary};
 pub use model::{StockShape, WorkpieceModel};
 pub use strategies::{
-    AdaptiveClearing, AdaptiveClearingParams,
-    ContourParallel, ContourParallelParams,
-    DrivePattern, SurfaceNormal5Axis, SurfaceNormal5AxisParams,
-    Swarf5Axis, Swarf5AxisParams,
-    ThreePlusTwo, ThreePlusTwoParams,
-    ToolpathStrategy,
+    AdaptiveClearing, AdaptiveClearingParams, ContourParallel, ContourParallelParams, DrivePattern,
+    SurfaceNormal5Axis, SurfaceNormal5AxisParams, Swarf5Axis, Swarf5AxisParams, ThreePlusTwo,
+    ThreePlusTwoParams, ToolpathStrategy,
 };
 pub use tool::{Tool, ToolHolder, ToolShape};
 pub use toolpath::{MoveType, OperationType, Toolpath, ToolpathPoint};
-pub use import::{import_stl, import_3mf};

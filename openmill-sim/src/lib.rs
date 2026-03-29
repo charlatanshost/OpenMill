@@ -1,2 +1,5 @@
-// openmill-sim — collision detection and material removal simulation.
-// Placeholder; implementation modules added incrementally.
+pub mod collision;
+
+pub use collision::{
+    build_tool_shape, build_tool_shapes, CollisionChecker, CollisionResult,
+};

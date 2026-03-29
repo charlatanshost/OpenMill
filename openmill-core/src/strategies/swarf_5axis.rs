@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use crate::kinematics::MachineConfig;
 use crate::model::WorkpieceModel;
@@ -14,7 +15,7 @@ use super::traits::ToolpathStrategy;
 pub struct Swarf5Axis;
 
 /// Tuning parameters for [`Swarf5Axis`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Swarf5AxisParams {
     /// Number of passes along the ruled surface [1..].
     pub num_passes: usize,

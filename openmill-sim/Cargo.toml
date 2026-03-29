@@ -7,4 +7,6 @@ edition = "2021"
 openmill-core = { path = "../openmill-core" }
 nalgebra = "0.33"
 parry3d = "0.17"
+anyhow = "1"
 log = "0.4"
+rayon = "1"

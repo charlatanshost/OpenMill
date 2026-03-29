@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use crate::kinematics::MachineConfig;
 use crate::model::WorkpieceModel;
@@ -14,7 +15,7 @@ use super::traits::ToolpathStrategy;
 pub struct AdaptiveClearing;
 
 /// Tuning parameters for [`AdaptiveClearing`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdaptiveClearingParams {
     /// Maximum tool engagement angle [degrees].
     pub max_engagement_deg: f64,
