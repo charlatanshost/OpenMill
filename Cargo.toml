@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "openmill-core",
+    "openmill-sim",
+    "openmill-post",
+    "openmill-ui",
+]
+resolver = "2"

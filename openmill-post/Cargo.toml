@@ -1,0 +1,16 @@
+[package]
+name = "openmill-post"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+openmill-core = { path = "../openmill-core" }
+nalgebra = "0.33"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+log = "0.4"
+
+[dev-dependencies]
+approx = "0.5"
