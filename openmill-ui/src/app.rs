@@ -1,8 +1,11 @@
 use std::path::PathBuf;
 
 use eframe::egui;
+use eframe::egui_wgpu;
 use openmill_core::*;
 use openmill_post::{GrblPost, LinuxCncPost, PostConfig, PostProcessor, Units};
+
+use crate::viewport::{OrbitCamera, Viewport};
 
 // ── Strategy names ──────────────────────────────────────────────────────────
 
@@ -33,12 +36,20 @@ pub struct OpenMillApp {
     add_tool_flute_len: f64,
     add_tool_shape: usize, // 0 = Flat, 1 = Ball
 
+    // 3D viewport
+    render_state: Option<egui_wgpu::RenderState>,
+    viewport: Option<Viewport>,
+    camera: OrbitCamera,
+
     // Status log
     log: Vec<String>,
 }
 
-impl Default for OpenMillApp {
-    fn default() -> Self {
+impl OpenMillApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let render_state = cc.wgpu_render_state.clone();
+        let viewport = render_state.as_ref().map(Viewport::new);
+
         Self {
             job: Job::default(),
             model: None,
@@ -49,6 +60,9 @@ impl Default for OpenMillApp {
             add_tool_diameter: 6.0,
             add_tool_flute_len: 20.0,
             add_tool_shape: 0,
+            render_state,
+            viewport,
+            camera: OrbitCamera::default(),
             log: vec!["OpenMill started.".into()],
         }
     }
@@ -470,42 +484,52 @@ impl OpenMillApp {
 impl OpenMillApp {
     fn show_central_panel(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(ref model) = self.model {
-                let aabb = &model.aabb;
-                let size = aabb.maxs - aabb.mins;
-                ui.heading("Model loaded");
-                ui.label(format!(
-                    "Bounding box: {:.1} x {:.1} x {:.1} mm",
-                    size.x, size.y, size.z
-                ));
-                let n_verts = model.mesh.vertices().len();
-                let n_tris = model.mesh.indices().len();
-                ui.label(format!("Vertices: {}  Triangles: {}", n_verts, n_tris));
+            let size = ui.available_size();
+            let (rect, response) =
+                ui.allocate_exact_size(size, egui::Sense::click_and_drag());
 
-                // Show toolpath stats
-                let total_paths: usize = self.toolpaths.iter().map(|v| v.len()).sum();
-                let total_points: usize = self.toolpaths.iter()
-                    .flat_map(|v| v.iter())
-                    .map(|tp| tp.points.len())
-                    .sum();
-                if total_paths > 0 {
-                    ui.separator();
-                    ui.label(format!("Toolpaths: {}  Points: {}", total_paths, total_points));
-                }
-
-                ui.separator();
-                ui.colored_label(
-                    egui::Color32::from_gray(120),
-                    "3D viewport will be implemented with wgpu rendering.",
-                );
+            // Camera input.
+            let scroll = if response.hovered() {
+                ui.input(|i| i.smooth_scroll_delta.y)
             } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        egui::RichText::new("Import a model via File > Import Model")
-                            .size(20.0)
-                            .color(egui::Color32::from_gray(140)),
-                    );
-                });
+                0.0
+            };
+            self.camera.handle_input(&response, scroll);
+
+            // Render and display.
+            if let (Some(rs), Some(vp)) = (&self.render_state, &mut self.viewport) {
+                let w = (size.x as u32).max(1);
+                let h = (size.y as u32).max(1);
+                vp.render(rs, &self.camera, w, h);
+
+                ui.painter().image(
+                    vp.texture_id,
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+
+            // Overlay: model info at top-left of viewport.
+            if self.model.is_some() {
+                let painter = ui.painter();
+                let text_pos = rect.left_top() + egui::vec2(8.0, 8.0);
+                let model = self.model.as_ref().unwrap();
+                let aabb = &model.aabb;
+                let sz = aabb.maxs - aabb.mins;
+                let info = format!(
+                    "{:.1} x {:.1} x {:.1} mm | {} verts | {} tris",
+                    sz.x, sz.y, sz.z,
+                    model.mesh.vertices().len(),
+                    model.mesh.indices().len(),
+                );
+                painter.text(
+                    text_pos,
+                    egui::Align2::LEFT_TOP,
+                    info,
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_rgba_premultiplied(200, 200, 200, 180),
+                );
             }
         });
     }
@@ -628,6 +652,18 @@ impl OpenMillApp {
                     size.x, size.y, size.z,
                     model.mesh.vertices().len(),
                 ));
+
+                // Upload mesh to GPU and focus camera.
+                if let (Some(rs), Some(vp)) = (&self.render_state, &mut self.viewport) {
+                    vp.upload_mesh(&rs.device, &model.mesh);
+                    let mins = aabb.mins;
+                    let maxs = aabb.maxs;
+                    self.camera.focus_on_aabb(
+                        [mins.x, mins.y, mins.z],
+                        [maxs.x, maxs.y, maxs.z],
+                    );
+                }
+
                 self.model = Some(model);
             }
             Err(e) => self.log.push(format!("Import failed: {e}")),

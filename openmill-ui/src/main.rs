@@ -1,4 +1,5 @@
 mod app;
+mod viewport;
 
 use app::OpenMillApp;
 
@@ -15,6 +16,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "OpenMill",
         options,
-        Box::new(|_cc| Ok(Box::new(OpenMillApp::default()))),
+        Box::new(|cc| Ok(Box::new(OpenMillApp::new(cc)))),
     )
 }
