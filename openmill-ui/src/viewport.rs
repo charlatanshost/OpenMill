@@ -49,6 +49,7 @@ fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
 struct Uniforms {
     view_proj: [[f32; 4]; 4],
     light_dir: [f32; 4], // xyz = direction, w = pad
+    camera_pos: [f32; 4], // xyz = position, w = pad
 }
 
 // ── WGSL shader ─────────────────────────────────────────────────────────────
@@ -57,6 +58,7 @@ const SHADER_SRC: &str = r#"
 struct Uniforms {
     view_proj: mat4x4<f32>,
     light_dir: vec4<f32>,
+    camera_pos: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -182,12 +184,25 @@ pub struct Viewport {
     line_pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    bind_group_layout: wgpu::BindGroupLayout,
 
     grid_buffer: wgpu::Buffer,
     grid_count: u32,
 
     mesh_buffer: Option<wgpu::Buffer>,
     mesh_count: u32,
+
+    stock_buffer: Option<wgpu::Buffer>,
+    stock_count: u32,
+
+    tool_buffer: Option<wgpu::Buffer>,
+    tool_count: u32,
+
+    path_buffer: Option<wgpu::Buffer>,
+    path_count: u32,
+
+    collision_buffer: Option<wgpu::Buffer>,
+    collision_count: u32,
 
     color_tex: wgpu::Texture,
     color_view: wgpu::TextureView,
@@ -196,6 +211,10 @@ pub struct Viewport {
     tex_size: [u32; 2],
     pub texture_id: egui::TextureId,
     target_format: wgpu::TextureFormat,
+    voxel_volume: Option<crate::voxel::VoxelVolume>,
+    voxel_compute_bg: Option<wgpu::BindGroup>,
+    voxel_render_bg: Option<wgpu::BindGroup>,
+    voxel_uniforms: crate::voxel::VoxelUniforms,
 }
 
 impl Viewport {
@@ -341,10 +360,19 @@ impl Viewport {
             line_pipeline,
             uniform_buffer,
             bind_group,
+            bind_group_layout,
             grid_buffer,
             grid_count,
             mesh_buffer: None,
             mesh_count: 0,
+            stock_buffer: None,
+            stock_count: 0,
+            tool_buffer: None,
+            tool_count: 0,
+            path_buffer: None,
+            path_count: 0,
+            collision_buffer: None,
+            collision_count: 0,
             color_tex,
             color_view,
             depth_tex,
@@ -352,6 +380,16 @@ impl Viewport {
             tex_size: [1, 1],
             texture_id,
             target_format,
+            voxel_volume: None,
+            voxel_compute_bg: None,
+            voxel_render_bg: None,
+            voxel_uniforms: crate::voxel::VoxelUniforms {
+                stock_min: [0.0; 4],
+                stock_max: [0.0; 4],
+                tool_start: [0.0; 4],
+                tool_end: [0.0; 4],
+                tool_params: [0.0; 4],
+            },
         }
     }
 
@@ -376,6 +414,353 @@ impl Viewport {
         ));
     }
 
+    /// Upload stock geometry as a wireframe.
+    pub fn upload_stock(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        aabb: &parry3d::bounding_volume::Aabb,
+        stock: &openmill_core::model::StockShape,
+    ) {
+        let mut v = Vec::new();
+        let color = [1.0, 0.65, 0.0]; // Orange wireframe
+        let zero_n = [0.0; 3];
+
+        let add_line = |v: &mut Vec<Vertex>, p1: [f32; 3], p2: [f32; 3]| {
+            v.push(Vertex { position: p1, normal: zero_n, color });
+            v.push(Vertex { position: p2, normal: zero_n, color });
+        };
+
+        match stock {
+            openmill_core::model::StockShape::BoundingBox { margin } => {
+                let min_x = aabb.mins.x - margin.x as f32;
+                let min_y = aabb.mins.y - margin.y as f32;
+                let min_z = aabb.mins.z - margin.z as f32;
+                let max_x = aabb.maxs.x + margin.x as f32;
+                let max_y = aabb.maxs.y + margin.y as f32;
+                let max_z = aabb.maxs.z + margin.z as f32;
+
+                let p = [
+                    [min_x, min_y, min_z], [max_x, min_y, min_z],
+                    [max_x, max_y, min_z], [min_x, max_y, min_z],
+                    [min_x, min_y, max_z], [max_x, min_y, max_z],
+                    [max_x, max_y, max_z], [min_x, max_y, max_z],
+                ];
+                // Bottom
+                add_line(&mut v, p[0], p[1]); add_line(&mut v, p[1], p[2]);
+                add_line(&mut v, p[2], p[3]); add_line(&mut v, p[3], p[0]);
+                // Top
+                add_line(&mut v, p[4], p[5]); add_line(&mut v, p[5], p[6]);
+                add_line(&mut v, p[6], p[7]); add_line(&mut v, p[7], p[4]);
+                // Sides
+                add_line(&mut v, p[0], p[4]); add_line(&mut v, p[1], p[5]);
+                add_line(&mut v, p[2], p[6]); add_line(&mut v, p[3], p[7]);
+            }
+            openmill_core::model::StockShape::Cylinder { diameter, height } => {
+                let cx = (aabb.mins.x + aabb.maxs.x) * 0.5;
+                let cy = (aabb.mins.y + aabb.maxs.y) * 0.5;
+                let min_z = aabb.mins.z;
+                let max_z = min_z + *height as f32;
+                let r = (*diameter * 0.5) as f32;
+
+                let segments = 32;
+                let mut prev_x = cx + r;
+                let mut prev_y = cy;
+                for i in 1..=segments {
+                    let angle = (i as f32 / segments as f32) * std::f32::consts::TAU;
+                    let x = cx + r * angle.cos();
+                    let y = cy + r * angle.sin();
+                    
+                    // Bottom circle
+                    add_line(&mut v, [prev_x, prev_y, min_z], [x, y, min_z]);
+                    // Top circle
+                    add_line(&mut v, [prev_x, prev_y, max_z], [x, y, max_z]);
+                    // Vertical lines (4 of them)
+                    if i % 8 == 0 {
+                        add_line(&mut v, [x, y, min_z], [x, y, max_z]);
+                    }
+
+                    prev_x = x;
+                    prev_y = y;
+                }
+            }
+        }
+
+        self.stock_count = v.len() as u32;
+        if v.is_empty() {
+            self.stock_buffer = None;
+            return;
+        }
+        self.stock_buffer = Some(device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("stock_buffer"),
+                contents: bytemuck::cast_slice(&v),
+                usage: wgpu::BufferUsages::VERTEX,
+            },
+        ));
+
+        // Initialize Voxel Volume
+        let res = [128, 128, 128]; // Lower resolution for stability first
+        let voxel_volume = crate::voxel::VoxelVolume::new(device, res, &self.bind_group_layout, self.target_format);
+        
+        let stock_min = match stock {
+            openmill_core::model::StockShape::BoundingBox { margin } => [
+                aabb.mins.x - margin.x as f32,
+                aabb.mins.y - margin.y as f32,
+                aabb.mins.z - margin.z as f32,
+                1.0
+            ],
+            openmill_core::model::StockShape::Cylinder { diameter, height: _ } => [
+                (aabb.mins.x + aabb.maxs.x) * 0.5 - (*diameter as f32 * 0.5),
+                (aabb.mins.y + aabb.maxs.y) * 0.5 - (*diameter as f32 * 0.5),
+                aabb.mins.z,
+                1.0
+            ],
+        };
+        let stock_max = match stock {
+            openmill_core::model::StockShape::BoundingBox { margin } => [
+                aabb.maxs.x + margin.x as f32,
+                aabb.maxs.y + margin.y as f32,
+                aabb.maxs.z + margin.z as f32,
+                1.0
+            ],
+            openmill_core::model::StockShape::Cylinder { diameter, height } => [
+                (aabb.mins.x + aabb.maxs.x) * 0.5 + (*diameter as f32 * 0.5),
+                (aabb.mins.y + aabb.maxs.y) * 0.5 + (*diameter as f32 * 0.5),
+                aabb.mins.z + *height as f32,
+                1.0
+            ],
+        };
+
+        self.voxel_compute_bg = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("voxel_compute_bg"),
+            layout: &voxel_volume.compute_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&voxel_volume.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: voxel_volume.uniform_buffer.as_entire_binding(),
+                },
+            ],
+        }));
+
+        self.voxel_render_bg = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("voxel_render_bg"),
+            layout: &voxel_volume.render_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&voxel_volume.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: voxel_volume.uniform_buffer.as_entire_binding(),
+                },
+            ],
+        }));
+        
+        voxel_volume.reset(queue);
+
+        // Initial uniform update
+        self.voxel_uniforms = crate::voxel::VoxelUniforms {
+            stock_min,
+            stock_max,
+            tool_start: [0.0; 4],
+            tool_end: [0.0; 4],
+            tool_params: [0.0; 4],
+        };
+        self.voxel_volume = Some(voxel_volume);
+    }
+
+    pub fn reset_voxel(&self, queue: &wgpu::Queue) {
+        if let Some(ref vol) = self.voxel_volume {
+            vol.reset(queue);
+        }
+    }
+
+    pub fn carve_voxel(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        start: &nalgebra::Isometry3<f32>,
+        end: &nalgebra::Isometry3<f32>,
+        tool: &openmill_core::Tool,
+    ) {
+        let Some(ref vol) = self.voxel_volume else { return };
+        let Some(ref bg) = self.voxel_compute_bg else { return };
+
+        // Update uniforms
+        let start_pos = start.translation.vector;
+        let end_pos = end.translation.vector;
+        
+        self.voxel_uniforms.tool_start = [start_pos.x, start_pos.y, start_pos.z, 1.0];
+        self.voxel_uniforms.tool_end = [end_pos.x, end_pos.y, end_pos.z, 1.0];
+        self.voxel_uniforms.tool_params = [tool.shape.diameter() as f32 * 0.5, tool.overall_length as f32, 0.0, 0.0];
+
+        queue.write_buffer(&vol.uniform_buffer, 0, bytemuck::cast_slice(&[self.voxel_uniforms]));
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("voxel_carve_encoder") });
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("voxel_carve_pass"), timestamp_writes: None });
+            compute_pass.set_pipeline(&vol.compute_pipeline);
+            compute_pass.set_bind_group(0, bg, &[]);
+            
+            // Dispatch over the volume
+            // Optimized dispatch would only cover the tool bounding box
+            let x = (vol.resolution[0] + 3) / 4;
+            let y = (vol.resolution[1] + 3) / 4;
+            let z = (vol.resolution[2] + 3) / 4;
+            compute_pass.dispatch_workgroups(x, y, z);
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Upload tool wireframe for simulation at a specific pose.
+    pub fn upload_tool(
+        &mut self,
+        device: &wgpu::Device,
+        pose: Option<&nalgebra::Isometry3<f32>>,
+        tool: Option<&openmill_core::Tool>,
+    ) {
+        if pose.is_none() || tool.is_none() {
+            self.tool_buffer = None;
+            self.tool_count = 0;
+            return;
+        }
+        let pose = pose.unwrap();
+        let tool = tool.unwrap();
+
+        let mut v = Vec::new();
+        let color = [0.2, 0.8, 1.0]; // Light blue wireframe for tool
+        let zero_n = [0.0; 3];
+
+        let add_line = |v: &mut Vec<Vertex>, p1: nalgebra::Point3<f32>, p2: nalgebra::Point3<f32>| {
+            // Transform points by pose
+            let tp1 = pose * p1;
+            let tp2 = pose * p2;
+            v.push(Vertex { position: [tp1.x, tp1.y, tp1.z], normal: zero_n, color });
+            v.push(Vertex { position: [tp2.x, tp2.y, tp2.z], normal: zero_n, color });
+        };
+
+        // Draw a simple cylinder
+        let r = tool.shape.diameter() as f32 / 2.0;
+        let h = tool.overall_length as f32;
+        let segments = 16;
+        let mut prev_pt = nalgebra::Point3::new(r, 0.0, 0.0);
+        
+        for i in 1..=segments {
+            let angle = (i as f32 / segments as f32) * std::f32::consts::TAU;
+            let x = r * angle.cos();
+            let y = r * angle.sin();
+            let pt = nalgebra::Point3::new(x, y, 0.0);
+            let pt_top = nalgebra::Point3::new(x, y, h);
+            let prev_top = nalgebra::Point3::new(prev_pt.x, prev_pt.y, h);
+            
+            // Bottom circle
+            add_line(&mut v, prev_pt, pt);
+            // Top circle
+            add_line(&mut v, prev_top, pt_top);
+            // Vertical lines
+            if i % 4 == 0 {
+                add_line(&mut v, pt, pt_top);
+            }
+            prev_pt = pt;
+        }
+
+        self.tool_count = v.len() as u32;
+        if v.is_empty() {
+            self.tool_buffer = None;
+            return;
+        }
+        self.tool_buffer = Some(device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("tool_buffer"),
+                contents: bytemuck::cast_slice(&v),
+                usage: wgpu::BufferUsages::VERTEX,
+            },
+        ));
+    }
+
+    pub fn upload_toolpath(&mut self, device: &wgpu::Device, paths: &[openmill_core::Toolpath]) {
+        let mut v = Vec::new();
+        let zero_n = [0.0; 3];
+
+        for tp in paths {
+            for i in 0..tp.points.len().saturating_sub(1) {
+                let p1 = tp.points[i].position;
+                let p2 = tp.points[i + 1].position;
+                let mtype = tp.points[i+1].move_type;
+
+                // Color based on move type
+                let color = match mtype {
+                    openmill_core::toolpath::MoveType::Rapid => [1.0, 0.2, 0.2],    // Red
+                    openmill_core::toolpath::MoveType::Linear => [0.2, 0.8, 1.0],   // Cyan
+                    openmill_core::toolpath::MoveType::LeadIn | openmill_core::toolpath::MoveType::LeadOut => [0.2, 1.0, 0.2], // Green
+                    openmill_core::toolpath::MoveType::Retract => [1.0, 1.0, 0.2], // Yellow
+                };
+
+                v.push(Vertex { 
+                    position: [p1.x as f32, p1.y as f32, p1.z as f32], 
+                    normal: zero_n, 
+                    color 
+                });
+                v.push(Vertex { 
+                    position: [p2.x as f32, p2.y as f32, p2.z as f32], 
+                    normal: zero_n, 
+                    color 
+                });
+            }
+        }
+
+        self.path_count = v.len() as u32;
+        if v.is_empty() {
+            self.path_buffer = None;
+            return;
+        }
+
+        self.path_buffer = Some(device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("path_buffer"),
+                contents: bytemuck::cast_slice(&v),
+                usage: wgpu::BufferUsages::VERTEX,
+            },
+        ));
+    }
+
+    pub fn upload_collisions(&mut self, device: &wgpu::Device, points: &[nalgebra::Point3<f32>]) {
+        let mut v = Vec::new();
+        let color = [1.0, 0.0, 0.0]; // Bright Red for collisions
+        let zero_n = [0.0; 3];
+        let size = 1.0f32; // Size of the collision X
+
+        for p in points {
+            // Draw a small 3D cross at each collision point
+            v.push(Vertex { position: [p.x - size, p.y, p.z], normal: zero_n, color });
+            v.push(Vertex { position: [p.x + size, p.y, p.z], normal: zero_n, color });
+            v.push(Vertex { position: [p.x, p.y - size, p.z], normal: zero_n, color });
+            v.push(Vertex { position: [p.x, p.y + size, p.z], normal: zero_n, color });
+            v.push(Vertex { position: [p.x, p.y, p.z - size], normal: zero_n, color });
+            v.push(Vertex { position: [p.x, p.y, p.z + size], normal: zero_n, color });
+        }
+
+        self.collision_count = v.len() as u32;
+        if v.is_empty() {
+            self.collision_buffer = None;
+            return;
+        }
+
+        self.collision_buffer = Some(device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("collision_buffer"),
+                contents: bytemuck::cast_slice(&v),
+                usage: wgpu::BufferUsages::VERTEX,
+            },
+        ));
+    }
+
     /// Render the scene to the offscreen texture.
     pub fn render(
         &mut self,
@@ -383,6 +768,8 @@ impl Viewport {
         camera: &OrbitCamera,
         width: u32,
         height: u32,
+        sim_progress: f32,
+        show_full_path: bool,
     ) {
         let device = &render_state.device;
         let queue = &render_state.queue;
@@ -409,14 +796,24 @@ impl Viewport {
                     self.texture_id,
                 );
         }
-
         // Update uniforms.
         let aspect = w as f32 / h as f32;
-        let uniforms = Uniforms {
-            view_proj: camera.view_proj(aspect),
-            light_dir: [0.3, 0.5, 0.8, 0.0],
-        };
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        let dir = [0.3, 0.5, 0.8];
+        let light_dir = [dir[0], dir[1], dir[2], 0.0];
+
+        // Camera position
+        let cam_pos = camera.eye();
+        let camera_pos = [cam_pos[0], cam_pos[1], cam_pos[2], 1.0];
+
+        queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            bytemuck::bytes_of(&Uniforms {
+                view_proj: camera.view_proj(aspect),
+                light_dir,
+                camera_pos,
+            }),
+        );
 
         // Render pass.
         let mut encoder =
@@ -460,6 +857,55 @@ impl Viewport {
                 pass.set_pipeline(&self.mesh_pipeline);
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..self.mesh_count, 0..1);
+            }
+
+            // Draw stock wireframe.
+            if let Some(ref buf) = self.stock_buffer {
+                pass.set_pipeline(&self.line_pipeline);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..self.stock_count, 0..1);
+            }
+
+            // Draw tool wireframe.
+            if let Some(ref buf) = self.tool_buffer {
+                pass.set_pipeline(&self.line_pipeline);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..self.tool_count, 0..1);
+            }
+
+            // Draw voxel volume.
+            if let (Some(ref vol), Some(ref bg)) = (&self.voxel_volume, &self.voxel_render_bg) {
+                pass.set_pipeline(&vol.render_pipeline);
+                pass.set_bind_group(0, bg, &[]);
+                pass.set_bind_group(1, &self.bind_group, &[]);
+                pass.draw(0..36, 0..1);
+
+                // Restore standard bind group for subsequent draw calls (toolpath, etc)
+                pass.set_bind_group(0, &self.bind_group, &[]);
+            }
+
+            // Draw path wireframe.
+            if let Some(ref buf) = self.path_buffer {
+                pass.set_pipeline(&self.line_pipeline);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                
+                let draw_count = if show_full_path {
+                    self.path_count
+                } else {
+                    let c = (self.path_count as f32 * sim_progress) as u32;
+                    c - (c % 2) // Snap to even number because it's a line list (2 verts per line)
+                };
+                
+                if draw_count > 0 {
+                    pass.draw(0..draw_count, 0..1);
+                }
+            }
+
+            // Draw collision markers.
+            if let Some(ref buf) = self.collision_buffer {
+                pass.set_pipeline(&self.line_pipeline);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..self.collision_count, 0..1);
             }
         }
 
@@ -591,8 +1037,8 @@ fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
     [
         [f / aspect, 0.0, 0.0, 0.0],
         [0.0, f, 0.0, 0.0],
-        [0.0, 0.0, far / (far - near), 1.0],
-        [0.0, 0.0, -near * far / (far - near), 0.0],
+        [0.0, 0.0, far / (near - far), -1.0],
+        [0.0, 0.0, near * far / (near - far), 0.0],
     ]
 }
 

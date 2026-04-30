@@ -40,6 +40,8 @@ pub fn default_trunnion_config() -> MachineConfig {
             y: (-200.0, 200.0),
             z: (-150.0, 0.0),
         },
+        post_processor: "LinuxCNC".into(),
+        post_config: crate::kinematics::types::PostConfig::default(),
     }
 }
 

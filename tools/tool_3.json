@@ -1,0 +1,14 @@
+{
+  "id": 3,
+  "name": "New Tool",
+  "shape": {
+    "type": "Dovetail",
+    "diameter": 3.0963111713216485,
+    "width": 12.0,
+    "angle": 60.0,
+    "flute_length": 20.0
+  },
+  "overall_length": 50.0,
+  "shank_diameter": 6.0,
+  "holder": null
+}

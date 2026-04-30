@@ -22,11 +22,59 @@ pub enum ToolShape {
     },
     /// Bull-nose (toroid / corner-radius) mill.
     BullNose {
-        /// Cutter diameter [mm].
         diameter: f64,
-        /// Corner radius [mm].  Must be ≤ diameter / 2.
         corner_radius: f64,
-        /// Length of fluted cutting region [mm].
+        flute_length: f64,
+    },
+    /// Chamfer mill / Engraving tool.
+    ChamferMill {
+        /// Tip diameter [mm].
+        tip_diameter: f64,
+        /// Major diameter [mm].
+        diameter: f64,
+        /// Included taper angle [degrees] (e.g. 90 for a 45° chamfer).
+        taper_angle: f64,
+        flute_length: f64,
+    },
+    /// Standard twist drill or center drill.
+    Drill {
+        diameter: f64,
+        /// Included point angle [degrees] (typically 118 or 135).
+        point_angle: f64,
+        flute_length: f64,
+    },
+    /// Tapered end mill (conical finishing).
+    TaperedMill {
+        /// Tip diameter [mm].
+        tip_diameter: f64,
+        /// Taper angle per side [degrees].
+        taper_angle: f64,
+        flute_length: f64,
+    },
+    /// Lollipop / Under-cutting spherical mill.
+    Lollipop {
+        /// Head diameter [mm].
+        diameter: f64,
+        /// Neck/Shank diameter [mm].
+        neck_diameter: f64,
+        flute_length: f64,
+    },
+    /// Dovetail / T-slot cutter.
+    Dovetail {
+        diameter: f64,
+        /// Width of the cutting slot [mm].
+        width: f64,
+        /// Dovetail angle [degrees] (e.g. 60).
+        angle: f64,
+        flute_length: f64,
+    },
+    /// Thread mill.
+    ThreadMill {
+        diameter: f64,
+        /// Pitch of the thread [mm].
+        pitch: f64,
+        /// Number of teeth.
+        num_teeth: usize,
         flute_length: f64,
     },
 }
@@ -37,7 +85,17 @@ impl ToolShape {
         match self {
             ToolShape::FlatEnd { diameter, .. }
             | ToolShape::BallEnd { diameter, .. }
-            | ToolShape::BullNose { diameter, .. } => *diameter,
+            | ToolShape::BullNose { diameter, .. }
+            | ToolShape::ChamferMill { diameter, .. }
+            | ToolShape::Drill { diameter, .. }
+            | ToolShape::Lollipop { diameter, .. }
+            | ToolShape::Dovetail { diameter, .. }
+            | ToolShape::ThreadMill { diameter, .. } => *diameter,
+            ToolShape::TaperedMill { tip_diameter, taper_angle, flute_length, .. } => {
+                // Return major diameter at top of flutes
+                let angle_rad = taper_angle.to_radians();
+                *tip_diameter + 2.0 * (*flute_length * angle_rad.tan())
+            }
         }
     }
 
@@ -46,8 +104,18 @@ impl ToolShape {
         match self {
             ToolShape::FlatEnd { flute_length, .. }
             | ToolShape::BallEnd { flute_length, .. }
-            | ToolShape::BullNose { flute_length, .. } => *flute_length,
+            | ToolShape::BullNose { flute_length, .. }
+            | ToolShape::ChamferMill { flute_length, .. }
+            | ToolShape::Drill { flute_length, .. }
+            | ToolShape::TaperedMill { flute_length, .. }
+            | ToolShape::Lollipop { flute_length, .. }
+            | ToolShape::Dovetail { flute_length, .. }
+            | ToolShape::ThreadMill { flute_length, .. } => *flute_length,
         }
+    }
+
+    pub fn is_ball(&self) -> bool {
+        matches!(self, ToolShape::BallEnd { .. })
     }
 }
 

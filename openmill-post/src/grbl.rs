@@ -4,10 +4,10 @@
 //! Uses G93 inverse-time mode for 5-axis cutting moves.
 
 use anyhow::Result;
-use openmill_core::{MachineConfig, MoveType, TableTable, Tool, Toolpath, ToolpathPoint};
+use openmill_core::{MachineConfig, MoveType, PostConfig, TableTable, Tool, Toolpath, ToolpathPoint, Units};
 
 use crate::feed_rate::{compute_inverse_time_feed_with_kin, joints_for_point};
-use crate::traits::{PostConfig, PostProcessor, Units};
+use crate::traits::PostProcessor;
 
 /// GRBL post-processor.
 pub struct GrblPost;
@@ -25,39 +25,39 @@ impl PostProcessor for GrblPost {
         &self,
         toolpath: &Toolpath,
         machine: &MachineConfig,
-    ) -> Result<String> {
+    ) -> Result<Vec<(String, Option<usize>)>> {
         let tt = TableTable::new(machine.clone())?;
-        let mut out = String::new();
+        let mut out = Vec::new();
 
-        out.push_str(&format!("({})\n", toolpath.name));
-        out.push_str("G93\n");
+        out.push((format!("({})\n", toolpath.name), None));
+        out.push(("G93\n".to_string(), None));
 
         let mut prev: Option<&ToolpathPoint> = None;
 
-        for pt in &toolpath.points {
+        for (i, pt) in toolpath.points.iter().enumerate() {
             let [x, y, z, a, c] = joints_for_point(&tt, pt)?;
 
             match pt.move_type {
                 MoveType::Rapid | MoveType::Retract => {
-                    out.push_str(&format!(
+                    out.push((format!(
                         "G0 X{x:.4} Y{y:.4} Z{z:.4} A{a:.4} C{c:.4}\n"
-                    ));
+                    ), Some(i)));
                 }
                 MoveType::Linear | MoveType::LeadIn | MoveType::LeadOut => {
                     let f = match prev {
                         Some(from) => compute_inverse_time_feed_with_kin(&tt, from, pt),
                         None => pt.feed_rate.max(1.0),
                     };
-                    out.push_str(&format!(
+                    out.push((format!(
                         "G1 X{x:.4} Y{y:.4} Z{z:.4} A{a:.4} C{c:.4} F{f:.4}\n"
-                    ));
+                    ), Some(i)));
                 }
             }
 
             prev = Some(pt);
         }
 
-        out.push_str("G94\n");
+        out.push(("G94\n".to_string(), None));
         Ok(out)
     }
 
@@ -103,7 +103,8 @@ mod tests {
             move_type: MoveType::Retract,
         });
 
-        let gcode = post.process_toolpath(&tp, &machine).unwrap();
+        let gcode_lines = post.process_toolpath(&tp, &machine).unwrap();
+        let gcode = gcode_lines.into_iter().map(|(s, _)| s).collect::<String>();
 
         assert!(gcode.contains("G0 "), "should contain rapid G0");
         assert!(gcode.contains("G1 "), "should contain linear G1");

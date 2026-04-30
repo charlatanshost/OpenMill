@@ -1,5 +1,6 @@
 use anyhow::Result;
 use nalgebra::{Point3, Rotation3, Unit, Vector3};
+use parry3d::query::{Ray, RayCast};
 use serde::{Deserialize, Serialize};
 
 use crate::kinematics::MachineConfig;
@@ -66,95 +67,141 @@ impl ToolpathStrategy for ThreePlusTwo {
         let rot = Rotation3::from_axis_angle(&Vector3::z_axis(), c_rad)
             * Rotation3::from_axis_angle(&Vector3::x_axis(), a_rad);
         let tool_axis = Unit::new_normalize(rot * Vector3::z());
+        
+        // We need a local frame where tool_axis is Z'.
+        // Local X' can be (UnitZ x tool_axis) or something stable.
+        let local_z = tool_axis;
+        let local_x = if local_z.z.abs() < 0.999 {
+            Unit::new_normalize(Vector3::z().cross(&local_z))
+        } else {
+            Unit::new_normalize(Vector3::x())
+        };
+        let local_y = Unit::new_normalize(local_z.cross(&local_x));
+        
+        let to_local = nalgebra::Isometry3::from_parts(
+            Point3::origin().into(),
+            nalgebra::UnitQuaternion::from_rotation_matrix(&nalgebra::Rotation3::from_matrix_unchecked(
+                nalgebra::Matrix3::from_columns(&[
+                    local_x.into_inner(),
+                    local_y.into_inner(),
+                    local_z.into_inner(),
+                ])
+            ).transpose())
+        );
+        let to_world = to_local.inverse();
 
-        // Stock AABB in workpiece coordinates.
+        // Transform model AABB or just sample points and find local bounds.
         let aabb = &model.aabb;
-        let mins = aabb.mins;
-        let maxs = aabb.maxs;
+        let corners = [
+            Point3::new(aabb.mins.x, aabb.mins.y, aabb.mins.z),
+            Point3::new(aabb.maxs.x, aabb.mins.y, aabb.mins.z),
+            Point3::new(aabb.mins.x, aabb.maxs.y, aabb.mins.z),
+            Point3::new(aabb.maxs.x, aabb.maxs.y, aabb.mins.z),
+            Point3::new(aabb.mins.x, aabb.mins.y, aabb.maxs.z),
+            Point3::new(aabb.maxs.x, aabb.mins.y, aabb.maxs.z),
+            Point3::new(aabb.mins.x, aabb.maxs.y, aabb.maxs.z),
+            Point3::new(aabb.maxs.x, aabb.maxs.y, aabb.maxs.z),
+        ];
+        
+        let mut local_mins = Point3::new(f64::MAX, f64::MAX, f64::MAX);
+        let mut local_maxs = Point3::new(f64::MIN, f64::MIN, f64::MIN);
+        
+        for c in corners {
+            let lp = to_local.transform_point(&c.cast::<f64>());
+            local_mins.x = local_mins.x.min(lp.x);
+            local_mins.y = local_mins.y.min(lp.y);
+            local_mins.z = local_mins.z.min(lp.z);
+            local_maxs.x = local_maxs.x.max(lp.x);
+            local_maxs.y = local_maxs.y.max(lp.y);
+            local_maxs.z = local_maxs.z.max(lp.z);
+        }
 
         let tool_r = tool.shape.diameter() / 2.0;
         let step_over_mm = tool.shape.diameter() * params.step_over;
 
-        // Work-plane local axes (X' along stock X, Y' as step-over direction).
-        // For the tilted plane we raster in world XY and step in Z layers.
-        let x_min = mins.x as f64 + tool_r;
-        let x_max = maxs.x as f64 - tool_r;
-        let y_min = mins.y as f64 + tool_r;
-        let y_max = maxs.y as f64 - tool_r;
-        let z_top = maxs.z as f64;
-        let z_bot = mins.z as f64;
+        let lx_min = local_mins.x + tool_r;
+        let lx_max = local_maxs.x - tool_r;
+        let ly_min = local_mins.y + tool_r;
+        let ly_max = local_maxs.y - tool_r;
+        let lz_top = local_maxs.z;
+        let lz_bot = local_mins.z;
 
-        if x_min >= x_max || y_min >= y_max || z_top <= z_bot {
+        if lx_min >= lx_max || ly_min >= ly_max {
             return Ok(vec![]);
         }
 
-        let safe_z = z_top + 5.0;
+        let safe_lz = lz_top + 10.0;
         let mut tp = Toolpath::new(tool.id, OperationType::Roughing, "3+2 Indexed Roughing");
 
-        // Start with retract to safe height.
-        tp.points.push(ToolpathPoint {
-            position: Point3::new(x_min, y_min, safe_z),
-            orientation: tool_axis,
-            feed_rate: 0.0,
-            move_type: MoveType::Rapid,
-        });
+        // Layer-by-layer step-down passes in local Z.
+        let mut lz = lz_top;
+        while lz > lz_bot {
+            lz = (lz - params.step_down).max(lz_bot);
 
-        // Layer-by-layer step-down passes.
-        let mut z = z_top;
-        while z > z_bot {
-            z = (z - params.step_down).max(z_bot);
-
-            // Zigzag raster rows along X, stepping over in Y.
-            let mut y = y_min;
+            let mut ly = ly_min;
             let mut forward = true;
-            while y <= y_max {
-                let (xa, xb) = if forward {
-                    (x_min, x_max)
-                } else {
-                    (x_max, x_min)
-                };
+            while ly <= ly_max {
+                let (lxa, lxb) = if forward { (lx_min, lx_max) } else { (lx_max, lx_min) };
+                let dist = (lxb - lxa).abs();
+                let steps = (dist / 1.0).ceil() as usize;
+                let mut segment_points = Vec::new();
 
-                // Rapid to row start at safe Z.
-                tp.points.push(ToolpathPoint {
-                    position: Point3::new(xa, y, safe_z),
-                    orientation: tool_axis,
-                    feed_rate: 0.0,
-                    move_type: MoveType::Rapid,
-                });
-                // Plunge to cutting depth.
-                tp.points.push(ToolpathPoint {
-                    position: Point3::new(xa, y, z),
-                    orientation: tool_axis,
-                    feed_rate: params.feed_rate * 0.5,
-                    move_type: MoveType::LeadIn,
-                });
-                // Cut across.
-                tp.points.push(ToolpathPoint {
-                    position: Point3::new(xb, y, z),
-                    orientation: tool_axis,
-                    feed_rate: params.feed_rate,
-                    move_type: MoveType::Linear,
-                });
-                // Retract.
-                tp.points.push(ToolpathPoint {
-                    position: Point3::new(xb, y, safe_z),
-                    orientation: tool_axis,
-                    feed_rate: 0.0,
-                    move_type: MoveType::Retract,
-                });
+                for i in 0..=steps {
+                    let t = i as f64 / steps as f64;
+                    let clx = lxa + (lxb - lxa) * t;
+                    
+                    let local_ray_start = Point3::new(clx, ly, safe_lz);
+                    let world_ray_start = to_world.transform_point(&local_ray_start);
+                    let world_ray_dir = -tool_axis.into_inner();
+                    
+                    let ray = Ray::new(
+                        world_ray_start.cast::<f32>(),
+                        world_ray_dir.cast::<f32>()
+                    );
+                    
+                    let mut hit_lz = lz_bot;
+                    if let Some(toi) = model.mesh.cast_local_ray(&ray, (safe_lz - lz_bot) as f32, true) {
+                        hit_lz = (safe_lz - toi as f64).max(lz_bot);
+                    }
+                    
+                    let target_lz = lz.max(hit_lz);
+                    segment_points.push(Point3::new(clx, ly, target_lz));
+                }
 
-                y += step_over_mm;
+                if !segment_points.is_empty() {
+                    // Lead-in from safe Z
+                    let first_world = to_world.transform_point(&Point3::new(lxa, ly, safe_lz));
+                    tp.points.push(ToolpathPoint {
+                        position: first_world,
+                        orientation: tool_axis,
+                        feed_rate: 0.0,
+                        move_type: MoveType::Rapid,
+                    });
+
+                    for (idx, lpt) in segment_points.into_iter().enumerate() {
+                        let world_pt = to_world.transform_point(&lpt);
+                        tp.points.push(ToolpathPoint {
+                            position: world_pt,
+                            orientation: tool_axis,
+                            feed_rate: if idx == 0 { params.feed_rate * 0.5 } else { params.feed_rate },
+                            move_type: if idx == 0 { MoveType::LeadIn } else { MoveType::Linear },
+                        });
+                    }
+
+                    // Retract to safe Z
+                    let last_world = to_world.transform_point(&Point3::new(lxb, ly, safe_lz));
+                    tp.points.push(ToolpathPoint {
+                        position: last_world,
+                        orientation: tool_axis,
+                        feed_rate: 0.0,
+                        move_type: MoveType::Retract,
+                    });
+                }
+
+                ly += step_over_mm;
                 forward = !forward;
             }
         }
-
-        // Final retract.
-        tp.points.push(ToolpathPoint {
-            position: Point3::new(x_min, y_min, safe_z),
-            orientation: tool_axis,
-            feed_rate: 0.0,
-            move_type: MoveType::Rapid,
-        });
 
         Ok(vec![tp])
     }

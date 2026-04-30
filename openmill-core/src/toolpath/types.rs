@@ -61,6 +61,16 @@ impl ToolpathPoint {
         }
     }
 
+    /// Create a retract point with a vertical tool axis.
+    pub fn retract(position: Point3<f64>) -> Self {
+        ToolpathPoint {
+            position,
+            orientation: Vector3::z_axis(),
+            feed_rate: 0.0,
+            move_type: MoveType::Retract,
+        }
+    }
+
     /// Euclidean distance in XYZ space to `other` [mm].
     pub fn distance_to(&self, other: &ToolpathPoint) -> f64 {
         (self.position - other.position).norm()

@@ -50,6 +50,36 @@ pub struct AxisLimits {
     pub z: (f64, f64),
 }
 
+// ── Post-Processor Configuration ──────────────────────────────────────────
+
+/// G-code unit system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Units {
+    Metric,
+    Imperial,
+}
+
+/// Top-level configuration for G-code output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostConfig {
+    /// Program number (O-word) for controls that require one.
+    pub program_number: u32,
+    /// Work coordinate offset code, e.g. `"G54"`, `"G55"`.
+    pub work_offset: String,
+    /// Unit system — determines whether the post emits G21 or G20.
+    pub units: Units,
+}
+
+impl Default for PostConfig {
+    fn default() -> Self {
+        PostConfig {
+            program_number: 1000,
+            work_offset: "G54".into(),
+            units: Units::Metric,
+        }
+    }
+}
+
 // ── Machine configuration ─────────────────────────────────────────────────────
 
 /// Complete machine configuration.
@@ -65,6 +95,10 @@ pub struct MachineConfig {
     pub pivot_offset: Vector3<f64>,
     /// Linear axis travel limits [mm].
     pub travel_limits: AxisLimits,
+    /// Default post-processor for this machine (e.g. "LinuxCNC", "GRBL").
+    pub post_processor: String,
+    /// Post-processor specific configuration.
+    pub post_config: PostConfig,
 }
 
 // ── Serde helper for Unit<Vector3<f64>> ──────────────────────────────────────

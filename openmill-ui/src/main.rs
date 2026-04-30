@@ -1,5 +1,6 @@
 mod app;
 mod viewport;
+mod voxel;
 
 use app::OpenMillApp;
 

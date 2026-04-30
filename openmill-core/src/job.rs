@@ -53,6 +53,27 @@ impl Default for StockDef {
     }
 }
 
+impl StockDef {
+    /// Convert the job-level stock definition into a core `StockShape`.
+    pub fn to_shape(&self) -> crate::model::StockShape {
+        match self {
+            StockDef::BoundingBox { margin } => crate::model::StockShape::BoundingBox {
+                margin: nalgebra::Vector3::new(margin[0], margin[1], margin[2]),
+            },
+            StockDef::Cylinder { diameter, height } => crate::model::StockShape::Cylinder {
+                diameter: *diameter,
+                height: *height,
+            },
+            StockDef::MeshFile { .. } => {
+                // Placeholder: fallback to bounding box for now if mesh isn't loaded
+                crate::model::StockShape::BoundingBox {
+                    margin: nalgebra::Vector3::new(5.0, 5.0, 5.0),
+                }
+            }
+        }
+    }
+}
+
 /// A single machining operation in the job's operation list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Operation {
