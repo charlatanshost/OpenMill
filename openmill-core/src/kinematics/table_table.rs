@@ -326,6 +326,8 @@ mod tests {
                 y: (-200.0, 200.0),
                 z: (-150.0, 0.0),
             },
+            post_processor: "LinuxCNC".to_string(),
+            post_config: crate::PostConfig::default(),
         };
         let machine_no_pivot = TableTable::new(config_no_pivot).unwrap();
 

@@ -107,7 +107,10 @@ impl ToolpathStrategy for Swarf5Axis {
         }
         
         if rulings.is_empty() {
-            return Ok(vec![]);
+            // No flank-contact points found — return the empty toolpath rather
+            // than an empty Vec so the UI's G-code terminal still shows the
+            // post-detected mode header instead of vanishing.
+            return Ok(vec![tp]);
         }
 
         let safe_z = params.z_top.max(params.z_bottom) + 10.0;

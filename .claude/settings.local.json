@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(cargo build *)"
+      "Bash(cargo build *)",
+      "Read(//c/Users/danie/.claude/projects/c--Users-danie-Downloads-OpenMill/**)",
+      "Read(//c/Users/danie/.claude/projects/**)",
+      "Bash(cargo test *)"
     ]
   }
 }

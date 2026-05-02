@@ -119,6 +119,109 @@ impl ToolShape {
     }
 }
 
+// ── Coolant ───────────────────────────────────────────────────────────────────
+
+/// Coolant mode requested for an operation or stored in a feed-and-speed preset.
+///
+/// `gcode_on()` returns the controller-specific code emitted at op start, and
+/// `gcode_off()` returns the off code (always `M9` for FANUC-compatible posts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Coolant {
+    #[default]
+    None,
+    /// Mist coolant — `M7`.
+    Mist,
+    /// Flood coolant — `M8`.
+    Flood,
+    /// Mist + flood simultaneously — `M7 M8`.
+    MistFlood,
+    /// Through-spindle coolant — `M88` (LinuxCNC).
+    Through,
+}
+
+impl Coolant {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Coolant::None      => "None",
+            Coolant::Mist      => "Mist (M7)",
+            Coolant::Flood     => "Flood (M8)",
+            Coolant::MistFlood => "Mist+Flood (M7 M8)",
+            Coolant::Through   => "Through (M88)",
+        }
+    }
+
+    /// G-code to enable this coolant mode, or `None` for `Coolant::None`.
+    pub fn gcode_on(&self) -> Option<&'static str> {
+        match self {
+            Coolant::None      => None,
+            Coolant::Mist      => Some("M7"),
+            Coolant::Flood     => Some("M8"),
+            Coolant::MistFlood => Some("M7 M8"),
+            Coolant::Through   => Some("M88"),
+        }
+    }
+
+    /// G-code to disable all coolant — `M9` on every dialect we support.
+    pub fn gcode_off() -> &'static str { "M9" }
+}
+
+// ── Feed and speed preset ────────────────────────────────────────────────────
+
+/// Saved feed-and-speed combination attached to a [`Tool`].
+///
+/// Picking a preset on an [`Operation`] copies these values onto the op
+/// (spindle, feed, plunge, coolant). Notes are informational only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FeedSpeedPreset {
+    pub name: String,
+    /// Material this preset targets (free-form, e.g. "6061 Aluminum").
+    #[serde(default)]
+    pub material: String,
+    /// Spindle speed [RPM].
+    pub spindle_rpm: f64,
+    /// Cutting feed rate [mm/min] for lateral moves.
+    pub feed_rate: f64,
+    /// Plunge feed rate [mm/min] for axial entry moves.
+    pub plunge_rate: f64,
+    #[serde(default)]
+    pub coolant: Coolant,
+    #[serde(default)]
+    pub notes: String,
+}
+
+/// Generate a small set of starter presets for a tool of `diameter_mm` with
+/// `flutes` flutes. Uses the same formulas as
+/// [`crate::Material::rpm_for_diameter`] / [`crate::Material::feed_rate`] for a
+/// handful of common materials. Plunge rate is set to 30% of cutting feed.
+pub fn starter_presets_for(diameter_mm: f64, flutes: u32) -> Vec<FeedSpeedPreset> {
+    let entries: &[(&str, &str, f64, f64, Coolant)] = &[
+        // (name,             material,           surface_speed m/min, chip_load mm/tooth, coolant)
+        ("6061 Aluminum",     "6061 Aluminum",    200.0, 0.05, Coolant::Mist),
+        ("Mild Steel",        "Mild Steel (1018)", 80.0, 0.03, Coolant::Flood),
+        ("HDPE / Plastic",    "HDPE Plastic",     300.0, 0.10, Coolant::None),
+        ("Hardwood",          "Hardwood (Maple/Oak)", 350.0, 0.12, Coolant::None),
+        ("Brass",             "Brass (360)",      120.0, 0.04, Coolant::None),
+    ];
+
+    entries
+        .iter()
+        .map(|(name, material, sfm, chip, coolant)| {
+            let rpm = (sfm * 1000.0) / (std::f64::consts::PI * diameter_mm.max(0.1));
+            let feed = chip * flutes as f64 * rpm;
+            FeedSpeedPreset {
+                name: (*name).into(),
+                material: (*material).into(),
+                spindle_rpm: rpm.round(),
+                feed_rate: feed.round(),
+                plunge_rate: (feed * 0.3).round().max(20.0),
+                coolant: *coolant,
+                notes: String::new(),
+            }
+        })
+        .collect()
+}
+
 // ── Tool holder ───────────────────────────────────────────────────────────────
 
 /// Axisymmetric holder silhouette as a series of (z, r) profile points.
@@ -143,6 +246,8 @@ pub struct ToolHolder {
 
 // ── Tool ──────────────────────────────────────────────────────────────────────
 
+fn default_flutes() -> u32 { 2 }
+
 /// Complete tool definition as it would appear in a tool library.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tool {
@@ -158,6 +263,19 @@ pub struct Tool {
     pub shank_diameter: f64,
     /// Optional holder; `None` means bare shank only.
     pub holder: Option<ToolHolder>,
+    /// Number of cutting flutes — used by feed-rate math.
+    #[serde(default = "default_flutes")]
+    pub flutes: u32,
+    /// Saved feed-and-speed combinations; the user picks one on an operation.
+    #[serde(default)]
+    pub presets: Vec<FeedSpeedPreset>,
+    /// Index into `presets` used as the default when this tool is selected.
+    #[serde(default)]
+    pub default_preset: Option<usize>,
+    /// Free-form G-code injected on every tool change for this tool
+    /// (e.g. probing routine, axis homing). Emitted after `M6 T#`.
+    #[serde(default)]
+    pub tool_change_gcode: Option<String>,
 }
 
 impl Tool {
@@ -175,6 +293,10 @@ impl Tool {
             overall_length: flute_length + 30.0,
             shank_diameter: diameter,
             holder: None,
+            flutes: 2,
+            presets: starter_presets_for(diameter, 2),
+            default_preset: Some(0),
+            tool_change_gcode: None,
         }
     }
 
@@ -192,6 +314,10 @@ impl Tool {
             overall_length: flute_length + 30.0,
             shank_diameter: diameter,
             holder: None,
+            flutes: 2,
+            presets: starter_presets_for(diameter, 2),
+            default_preset: Some(0),
+            tool_change_gcode: None,
         }
     }
 }

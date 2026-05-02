@@ -2,13 +2,17 @@
   "id": 3,
   "name": "New Tool",
   "shape": {
-    "type": "Dovetail",
-    "diameter": 3.0963111713216485,
-    "width": 12.0,
-    "angle": 60.0,
-    "flute_length": 20.0
+    "type": "ThreadMill",
+    "diameter": 6.6,
+    "pitch": 1.5,
+    "num_teeth": 1,
+    "flute_length": 8.8
   },
-  "overall_length": 50.0,
+  "overall_length": 63.0,
   "shank_diameter": 6.0,
-  "holder": null
+  "holder": null,
+  "flutes": 12,
+  "presets": [],
+  "default_preset": null,
+  "tool_change_gcode": null
 }

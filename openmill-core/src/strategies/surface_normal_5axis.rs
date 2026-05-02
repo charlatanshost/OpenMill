@@ -263,10 +263,16 @@ impl SurfaceNormal5Axis {
         let tool_r = tool.shape.diameter() / 2.0;
         let step_over_mm = tool.shape.diameter() * params.step_over;
 
-        // Rotary scan around X axis
+        // Rotary scan around the X axis, centred on the model's YZ centroid
+        // so the strategy works for parts that aren't placed at the world
+        // origin.
         let x_min = mins.x as f64;
         let x_max = maxs.x as f64;
-        let r_max = (mins.y.abs().max(maxs.y.abs()).max(mins.z.abs()).max(maxs.z.abs())) as f64 + 10.0;
+        let center_y = (mins.y + maxs.y) as f64 * 0.5;
+        let center_z = (mins.z + maxs.z) as f64 * 0.5;
+        let half_y = (maxs.y - mins.y) as f64 * 0.5;
+        let half_z = (maxs.z - mins.z) as f64 * 0.5;
+        let r_max = half_y.max(half_z) + tool_r + 10.0;
         let safe_r = r_max + 10.0;
 
         let mut x = x_min;
@@ -278,10 +284,10 @@ impl SurfaceNormal5Axis {
             for i in 0..=ang_steps {
                 let angle_deg = if forward { i as f64 } else { (ang_steps - i) as f64 };
                 let angle_rad = angle_deg.to_radians();
-                
+
                 // Direction from center to tool
                 let dir = Vector3::new(0.0, angle_rad.cos(), angle_rad.sin());
-                let start_pt = Point3::new(x, 0.0, 0.0) + dir * safe_r;
+                let start_pt = Point3::new(x, center_y, center_z) + dir * safe_r;
                 
                 let ray = Ray::new(
                     start_pt.cast::<f32>(),

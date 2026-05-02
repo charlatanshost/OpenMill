@@ -40,12 +40,31 @@ cargo run -p openmill-ui
 - We use **Vanilla Rust** with a focus on high-performance math (`nalgebra`) and GPU interaction (`wgpu`).
 - Avoid adding heavy dependencies unless necessary.
 - Keep the `openmill-core` crate free of UI logic.
+- All new fields on persisted types (`Tool`, `Operation`, `MachineConfig`, etc.) should be `#[serde(default)]` so existing `tools/*.json` and `machines/*.json` files keep loading.
+- Roughing strategies must use `model.stock_aabb()` for scan bounds, not `model.aabb`.
+
+### Where to Extend
+- **New strategy:** implement `ToolpathStrategy` in `openmill-core/src/strategies/`, register it in `mod.rs`, add it to `STRATEGIES` in `openmill-ui/src/app.rs`, wire up the dispatch arm and a params editor in `show_strategy_params`.
+- **New post-processor:** implement `PostProcessor` in `openmill-post`, add it to `POST_PROCESSOR_NAMES` and `get_post()` in `openmill-post/src/lib.rs`. Follow the per-op emission contract documented on the `PostProcessor` trait.
 
 ## 🗺️ Roadmap
-- [ ] True heat-method geodesic solver for `GeodesicParallel`.
+
+**Done**
+- [x] 4+1 indexed milling.
+- [x] G93 / G94 auto-mode selection per toolpath.
+- [x] Per-tool feed-and-speed presets, per-op coolant + custom G-code.
+- [x] Stock-aware roughing (3+2, 4+1, Adaptive Clearing, Contour Parallel).
+- [x] Plan / Simulation view split with translucent ghost-mesh collision overlay.
+
+**Next up**
+- [ ] True trochoidal medial-axis paths in `AdaptiveClearing` (the current implementation is a stock-aware raster).
+- [ ] True heat-method geodesic solver for `GeodesicParallel` (currently uses Z-height as a distance proxy).
+- [ ] Mesh-based stock support (`StockDef::MeshFile`).
+- [ ] Tool-holder collision detection (currently only the cutter is checked).
+- [ ] Hole auto-detection from imported mesh (currently manual hole list in 5-Axis Drilling).
+- [ ] Job save/load (`*.omj`) — full round-trip of model + ops + tools + machine.
 - [ ] S-curve acceleration in post-processors.
-- [ ] Collision detection for tool holders and machine components.
-- [ ] Support for 4-axis rotary wrapping.
+- [ ] Additional post-processors (Mach3/4, Centroid, Haas).
 
 ## ⚖️ Code of Conduct
 Please be respectful and constructive in all interactions. We aim to build a welcoming community for everyone interested in open-source manufacturing.

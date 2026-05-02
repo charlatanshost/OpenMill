@@ -1,5 +1,6 @@
 use nalgebra::Vector3;
 use parry3d::bounding_volume::Aabb;
+use parry3d::math::Point as PPoint;
 use parry3d::shape::TriMesh;
 
 // ── Stock shape ───────────────────────────────────────────────────────────────
@@ -48,5 +49,38 @@ impl WorkpieceModel {
             margin: Vector3::new(margin, margin, margin),
         };
         Self::new(mesh, stock)
+    }
+
+    /// Axis-aligned bounding box of the **stock**, in workpiece coordinates.
+    ///
+    /// Roughing strategies should use this (not [`Self::aabb`]) when planning
+    /// scan bounds — otherwise they only cover the part envelope and never
+    /// clear the outer stock material.
+    pub fn stock_aabb(&self) -> Aabb {
+        match &self.stock {
+            StockShape::BoundingBox { margin } => Aabb::new(
+                PPoint::new(
+                    self.aabb.mins.x - margin.x as f32,
+                    self.aabb.mins.y - margin.y as f32,
+                    self.aabb.mins.z - margin.z as f32,
+                ),
+                PPoint::new(
+                    self.aabb.maxs.x + margin.x as f32,
+                    self.aabb.maxs.y + margin.y as f32,
+                    self.aabb.maxs.z + margin.z as f32,
+                ),
+            ),
+            StockShape::Cylinder { diameter, height } => {
+                let cx = (self.aabb.mins.x + self.aabb.maxs.x) * 0.5;
+                let cy = (self.aabb.mins.y + self.aabb.maxs.y) * 0.5;
+                let r = (*diameter * 0.5) as f32;
+                let z_min = self.aabb.mins.z;
+                let z_max = z_min + *height as f32;
+                Aabb::new(
+                    PPoint::new(cx - r, cy - r, z_min),
+                    PPoint::new(cx + r, cy + r, z_max),
+                )
+            }
+        }
     }
 }

@@ -1,0 +1,63 @@
+{
+  "id": 4,
+  "name": "New Tool",
+  "shape": {
+    "type": "TaperedMill",
+    "tip_diameter": 1.0,
+    "taper_angle": 5.3,
+    "flute_length": 27.3
+  },
+  "overall_length": 55.0,
+  "shank_diameter": 6.0,
+  "holder": null,
+  "flutes": 2,
+  "presets": [
+    {
+      "name": "6061 Aluminum",
+      "material": "6061 Aluminum",
+      "spindle_rpm": 10610.0,
+      "feed_rate": 1061.0,
+      "plunge_rate": 318.0,
+      "coolant": "mist",
+      "notes": ""
+    },
+    {
+      "name": "Mild Steel",
+      "material": "Mild Steel (1018)",
+      "spindle_rpm": 4244.0,
+      "feed_rate": 255.0,
+      "plunge_rate": 76.0,
+      "coolant": "flood",
+      "notes": ""
+    },
+    {
+      "name": "HDPE / Plastic",
+      "material": "HDPE Plastic",
+      "spindle_rpm": 15915.0,
+      "feed_rate": 3183.0,
+      "plunge_rate": 955.0,
+      "coolant": "none",
+      "notes": ""
+    },
+    {
+      "name": "Hardwood",
+      "material": "Hardwood (Maple/Oak)",
+      "spindle_rpm": 18568.0,
+      "feed_rate": 4456.0,
+      "plunge_rate": 1337.0,
+      "coolant": "none",
+      "notes": ""
+    },
+    {
+      "name": "Brass",
+      "material": "Brass (360)",
+      "spindle_rpm": 6366.0,
+      "feed_rate": 509.0,
+      "plunge_rate": 153.0,
+      "coolant": "none",
+      "notes": ""
+    }
+  ],
+  "default_preset": 0,
+  "tool_change_gcode": null
+}

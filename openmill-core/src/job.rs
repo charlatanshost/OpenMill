@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::fixture::Fixture;
 use crate::kinematics::MachineConfig;
-use crate::tool::Tool;
+use crate::tool::{Coolant, Tool};
 
 
 /// Top-level project container holding everything needed to machine a part.
@@ -87,6 +87,22 @@ pub struct Operation {
     pub params: serde_json::Value,
     /// Spindle speed [RPM].
     pub spindle_speed: f64,
+    /// Cutting feed rate [mm/min] for lateral moves. `0.0` means "use whatever
+    /// the strategy embeds in each toolpath point".
+    #[serde(default)]
+    pub feed_rate: f64,
+    /// Plunge feed rate [mm/min] for axial entry moves. `0.0` falls back to
+    /// `feed_rate * 0.5`.
+    #[serde(default)]
+    pub plunge_rate: f64,
+    /// Coolant mode active for this operation.
+    #[serde(default)]
+    pub coolant: Coolant,
+    /// Free-form G-code injected at the start of this operation, after the
+    /// spindle and coolant have been turned on. Use for probing, axis homing,
+    /// or any controller-specific setup.
+    #[serde(default)]
+    pub gcode_command: String,
     /// Whether this operation is enabled.
     pub enabled: bool,
 }

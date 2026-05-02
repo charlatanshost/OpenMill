@@ -108,6 +108,29 @@ impl Toolpath {
         self.points.is_empty()
     }
 
+    /// Return a copy of this toolpath with cutting and plunge feed rates
+    /// overridden by the given values. A value of `0.0` leaves that move type's
+    /// feed unchanged so strategy-supplied feeds are preserved when the user
+    /// hasn't dialled in an op-level override.
+    ///
+    /// - `cutting_feed` overrides every `MoveType::Linear` and `MoveType::LeadOut`.
+    /// - `plunge_feed` overrides every `MoveType::LeadIn` (the entry move).
+    pub fn with_op_feeds(&self, cutting_feed: f64, plunge_feed: f64) -> Toolpath {
+        let mut out = self.clone();
+        for pt in &mut out.points {
+            match pt.move_type {
+                MoveType::Linear | MoveType::LeadOut if cutting_feed > 0.0 => {
+                    pt.feed_rate = cutting_feed;
+                }
+                MoveType::LeadIn if plunge_feed > 0.0 => {
+                    pt.feed_rate = plunge_feed;
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
     /// Total arc length of **cutting** (Linear + Lead*) moves [mm].
     pub fn cutting_length(&self) -> f64 {
         self.points.windows(2).fold(0.0, |acc, w| {

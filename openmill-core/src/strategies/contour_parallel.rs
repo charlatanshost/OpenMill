@@ -50,26 +50,32 @@ impl ToolpathStrategy for ContourParallel {
         _machine: &MachineConfig,
         params: &ContourParallelParams,
     ) -> Result<Vec<Toolpath>> {
-        let aabb = &model.aabb;
-        let z_min = aabb.mins.z as f64;
-        let z_max = aabb.maxs.z as f64;
+        // Step Z from the **stock** top (not just the part top) down to the
+        // part bottom so the upper stock margin gets contoured too. The
+        // horizontal scan radius also uses the stock footprint so the tool
+        // can reach the outer stock material on each pass.
+        let part_aabb = &model.aabb;
+        let stock_aabb = model.stock_aabb();
+        let z_min = part_aabb.mins.z as f64;
+        let z_max = stock_aabb.maxs.z as f64;
         let safe_z = z_max + 10.0;
         let tool_r = tool.shape.diameter() / 2.0;
-        
+
         let mut toolpaths = Vec::new();
         let mut z = z_max;
 
         while z >= z_min {
             let mut tp = Toolpath::new(tool.id, OperationType::Finishing, "Waterline Pass");
             let mut pass_points = Vec::new();
-            
+
             // Simple approach: circular scan at this Z level
             // For a production system, we'd slice the actual mesh geometry
             // Here we use raycasting to find the boundary of the part at this Z
             let ang_steps = 360;
-            let center_x = (aabb.mins.x + aabb.maxs.x) as f64 * 0.5;
-            let center_y = (aabb.mins.y + aabb.maxs.y) as f64 * 0.5;
-            let scan_r = (aabb.maxs.x - aabb.mins.x).max(aabb.maxs.y - aabb.mins.y) as f64 + tool_r + 5.0;
+            let center_x = (stock_aabb.mins.x + stock_aabb.maxs.x) as f64 * 0.5;
+            let center_y = (stock_aabb.mins.y + stock_aabb.maxs.y) as f64 * 0.5;
+            let scan_r = (stock_aabb.maxs.x - stock_aabb.mins.x)
+                .max(stock_aabb.maxs.y - stock_aabb.mins.y) as f64 + tool_r + 5.0;
 
             for i in 0..=ang_steps {
                 let angle = (i as f64).to_radians();

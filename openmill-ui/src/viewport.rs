@@ -95,6 +95,19 @@ fn fs_lit(in: VsOut) -> @location(0) vec4<f32> {
 fn fs_flat(in: VsOut) -> @location(0) vec4<f32> {
     return vec4(in.color, 1.0);
 }
+
+// Ghost / X-ray mesh: a translucent always-visible silhouette of the part,
+// used in Simulation view so the user can see where the tool is relative to
+// the finished part shape even when stock material is between camera and part.
+@fragment
+fn fs_ghost(in: VsOut) -> @location(0) vec4<f32> {
+    let n = normalize(in.normal);
+    let l = normalize(u.light_dir.xyz);
+    // Front faces glow more, back faces fade — produces a clear silhouette.
+    let facing = abs(dot(n, l)) * 0.5 + 0.5;
+    let tint   = vec3(0.95, 0.25, 0.30);
+    return vec4(tint * facing, 0.45);
+}
 "#;
 
 // ── Orbit camera ────────────────────────────────────────────────────────────
@@ -181,6 +194,10 @@ impl OrbitCamera {
 
 pub struct Viewport {
     mesh_pipeline: wgpu::RenderPipeline,
+    /// Translucent always-on-top mesh pipeline used in Sim view to show the
+    /// part silhouette through the stock — lets the user spot tool-mesh
+    /// collisions even when the stock voxel still has material in front.
+    ghost_mesh_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -306,6 +323,48 @@ impl Viewport {
             cache: None,
         });
 
+        // Ghost-mesh pipeline: translucent X-ray silhouette of the part,
+        // drawn in Sim view on top of the voxel stock so collisions between
+        // the tool and the finished-part surface are visible even when stock
+        // is still in the way. Always passes depth so it's never occluded.
+        let ghost_depth_stencil = wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::Always,
+            stencil: Default::default(),
+            bias: Default::default(),
+        };
+        let ghost_mesh_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ghost_mesh_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[vertex_layout()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_ghost",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(ghost_depth_stencil),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+
         // Line pipeline (lines, flat color, no culling)
         let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("line_pipeline"),
@@ -357,6 +416,7 @@ impl Viewport {
 
         Self {
             mesh_pipeline,
+            ghost_mesh_pipeline,
             line_pipeline,
             uniform_buffer,
             bind_group,
@@ -384,11 +444,13 @@ impl Viewport {
             voxel_compute_bg: None,
             voxel_render_bg: None,
             voxel_uniforms: crate::voxel::VoxelUniforms {
-                stock_min: [0.0; 4],
-                stock_max: [0.0; 4],
-                tool_start: [0.0; 4],
-                tool_end: [0.0; 4],
-                tool_params: [0.0; 4],
+                stock_min:       [0.0; 4],
+                stock_max:       [0.0; 4],
+                tool_start:      [0.0; 4],
+                tool_end:        [0.0; 4],
+                tool_axis_start: [0.0, 0.0, 1.0, 0.0],
+                tool_axis_end:   [0.0, 0.0, 1.0, 0.0],
+                tool_params:     [0.0; 4],
             },
         }
     }
@@ -568,9 +630,11 @@ impl Viewport {
         self.voxel_uniforms = crate::voxel::VoxelUniforms {
             stock_min,
             stock_max,
-            tool_start: [0.0; 4],
-            tool_end: [0.0; 4],
-            tool_params: [0.0; 4],
+            tool_start:      [0.0; 4],
+            tool_end:        [0.0; 4],
+            tool_axis_start: [0.0, 0.0, 1.0, 0.0],
+            tool_axis_end:   [0.0, 0.0, 1.0, 0.0],
+            tool_params:     [0.0; 4],
         };
         self.voxel_volume = Some(voxel_volume);
     }
@@ -592,13 +656,30 @@ impl Viewport {
         let Some(ref vol) = self.voxel_volume else { return };
         let Some(ref bg) = self.voxel_compute_bg else { return };
 
-        // Update uniforms
+        // Tip positions
         let start_pos = start.translation.vector;
         let end_pos = end.translation.vector;
-        
+
+        // Tool axis at each pose: pose rotation applied to local +Z. The
+        // toolpath builder sets each pose so that local +Z aligns with the
+        // tool body (pointing from the tip toward the spindle).
+        let axis_start = start.rotation * nalgebra::Vector3::z();
+        let axis_end   = end.rotation   * nalgebra::Vector3::z();
+
         self.voxel_uniforms.tool_start = [start_pos.x, start_pos.y, start_pos.z, 1.0];
-        self.voxel_uniforms.tool_end = [end_pos.x, end_pos.y, end_pos.z, 1.0];
-        self.voxel_uniforms.tool_params = [tool.shape.diameter() as f32 * 0.5, tool.overall_length as f32, 0.0, 0.0];
+        self.voxel_uniforms.tool_end   = [end_pos.x,   end_pos.y,   end_pos.z,   1.0];
+        self.voxel_uniforms.tool_axis_start = [axis_start.x, axis_start.y, axis_start.z, 0.0];
+        self.voxel_uniforms.tool_axis_end   = [axis_end.x,   axis_end.y,   axis_end.z,   0.0];
+        // Cutting length is the flute length — the shank above shouldn't
+        // remove material in a normal cut (and modelling it as cutting would
+        // gouge stock above the tool).
+        let cutting_len = tool.shape.flute_length() as f32;
+        self.voxel_uniforms.tool_params = [
+            tool.shape.diameter() as f32 * 0.5,
+            cutting_len.max(0.5),
+            0.0,
+            0.0,
+        ];
 
         queue.write_buffer(&vol.uniform_buffer, 0, bytemuck::cast_slice(&[self.voxel_uniforms]));
 
@@ -762,6 +843,10 @@ impl Viewport {
     }
 
     /// Render the scene to the offscreen texture.
+    ///
+    /// `show_mesh` draws the original part mesh (Plan view). `show_voxel`
+    /// draws the carved stock volume (Simulation view). Stock wireframe,
+    /// toolpath, and tool always render.
     pub fn render(
         &mut self,
         render_state: &egui_wgpu::RenderState,
@@ -770,6 +855,8 @@ impl Viewport {
         height: u32,
         sim_progress: f32,
         show_full_path: bool,
+        show_mesh: bool,
+        show_voxel: bool,
     ) {
         let device = &render_state.device;
         let queue = &render_state.queue;
@@ -852,11 +939,13 @@ impl Viewport {
             pass.set_vertex_buffer(0, self.grid_buffer.slice(..));
             pass.draw(0..self.grid_count, 0..1);
 
-            // Draw mesh.
-            if let Some(ref buf) = self.mesh_buffer {
-                pass.set_pipeline(&self.mesh_pipeline);
-                pass.set_vertex_buffer(0, buf.slice(..));
-                pass.draw(0..self.mesh_count, 0..1);
+            // Draw solid mesh — Plan view only.
+            if show_mesh {
+                if let Some(ref buf) = self.mesh_buffer {
+                    pass.set_pipeline(&self.mesh_pipeline);
+                    pass.set_vertex_buffer(0, buf.slice(..));
+                    pass.draw(0..self.mesh_count, 0..1);
+                }
             }
 
             // Draw stock wireframe.
@@ -873,15 +962,28 @@ impl Viewport {
                 pass.draw(0..self.tool_count, 0..1);
             }
 
-            // Draw voxel volume.
-            if let (Some(ref vol), Some(ref bg)) = (&self.voxel_volume, &self.voxel_render_bg) {
-                pass.set_pipeline(&vol.render_pipeline);
-                pass.set_bind_group(0, bg, &[]);
-                pass.set_bind_group(1, &self.bind_group, &[]);
-                pass.draw(0..36, 0..1);
+            // Draw voxel volume (Simulation view only).
+            if show_voxel {
+                if let (Some(ref vol), Some(ref bg)) = (&self.voxel_volume, &self.voxel_render_bg) {
+                    pass.set_pipeline(&vol.render_pipeline);
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.set_bind_group(1, &self.bind_group, &[]);
+                    pass.draw(0..36, 0..1);
 
-                // Restore standard bind group for subsequent draw calls (toolpath, etc)
-                pass.set_bind_group(0, &self.bind_group, &[]);
+                    // Restore standard bind group for subsequent draw calls (toolpath, etc)
+                    pass.set_bind_group(0, &self.bind_group, &[]);
+                }
+
+                // Ghost-mesh overlay: drawn AFTER the voxel so the part
+                // silhouette shows through the stock. depth=Always means it's
+                // never occluded; alpha blending keeps the underlying stock
+                // visible. The user can see the tool gouging into the part
+                // even when stock material is still in front.
+                if let Some(ref buf) = self.mesh_buffer {
+                    pass.set_pipeline(&self.ghost_mesh_pipeline);
+                    pass.set_vertex_buffer(0, buf.slice(..));
+                    pass.draw(0..self.mesh_count, 0..1);
+                }
             }
 
             // Draw path wireframe.

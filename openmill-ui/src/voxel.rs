@@ -6,9 +6,17 @@ use bytemuck::{Pod, Zeroable};
 pub struct VoxelUniforms {
     pub stock_min: [f32; 4],
     pub stock_max: [f32; 4],
+    /// Tool **tip** position at the start of the swept move.
     pub tool_start: [f32; 4],
+    /// Tool **tip** position at the end of the swept move.
     pub tool_end: [f32; 4],
-    pub tool_params: [f32; 4], // x = radius, y = length
+    /// Unit vector along the tool body, pointing from tip toward shank, at the
+    /// start pose (xyz; w unused).
+    pub tool_axis_start: [f32; 4],
+    /// Same at the end pose.
+    pub tool_axis_end: [f32; 4],
+    /// `x = cutter_radius`, `y = cutting_length` (flute length), z/w unused.
+    pub tool_params: [f32; 4],
 }
 
 pub struct VoxelVolume {
@@ -25,11 +33,13 @@ pub struct VoxelVolume {
 impl VoxelVolume {
     const COMPUTE_SHADER: &'static str = r#"
         struct Uniforms {
-            stock_min: vec4<f32>,
-            stock_max: vec4<f32>,
-            tool_start: vec4<f32>,
-            tool_end: vec4<f32>,
-            tool_params: vec4<f32>,
+            stock_min:       vec4<f32>,
+            stock_max:       vec4<f32>,
+            tool_start:      vec4<f32>,
+            tool_end:        vec4<f32>,
+            tool_axis_start: vec4<f32>,
+            tool_axis_end:   vec4<f32>,
+            tool_params:     vec4<f32>, // x = radius, y = cutting_length
         };
 
         @group(0) @binding(0) var voxels: texture_storage_3d<r32uint, write>;
@@ -38,7 +48,8 @@ impl VoxelVolume {
         fn dist_to_segment(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>) -> f32 {
             let pa = p - a;
             let ba = b - a;
-            let h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+            let denom = max(dot(ba, ba), 1e-8);
+            let h = clamp(dot(pa, ba) / denom, 0.0, 1.0);
             return length(pa - ba * h);
         }
 
@@ -50,20 +61,40 @@ impl VoxelVolume {
             let norm_pos = vec3<f32>(id) / dims;
             let world_pos = u.stock_min.xyz + norm_pos * (u.stock_max.xyz - u.stock_min.xyz);
 
-            let dist = dist_to_segment(world_pos, u.tool_start.xyz, u.tool_end.xyz);
-            if (dist < u.tool_params.x) {
-                textureStore(voxels, id, vec4<u32>(0, 0, 0, 0));
+            let radius   = u.tool_params.x;
+            let cut_len  = max(u.tool_params.y, 0.001);
+
+            // Sweep the **entire tool body** between the start and end poses.
+            // At each height h up the tool body we have a line segment from
+            //   tool_start.xyz + axis_start * h
+            //   tool_end.xyz   + axis_end   * h
+            // The swept volume of all those segments is what the tool removes.
+            // Sampling several heights along the body approximates that
+            // volume — without this, only the thin tip-path tube was carved
+            // and material above the tip never disappeared.
+            let SAMPLES: i32 = 6;
+            for (var i = 0; i <= SAMPLES; i = i + 1) {
+                let h = f32(i) / f32(SAMPLES) * cut_len;
+                let a = u.tool_start.xyz + u.tool_axis_start.xyz * h;
+                let b = u.tool_end.xyz   + u.tool_axis_end.xyz   * h;
+                let d = dist_to_segment(world_pos, a, b);
+                if (d < radius) {
+                    textureStore(voxels, id, vec4<u32>(0, 0, 0, 0));
+                    return;
+                }
             }
         }
     "#;
 
     const RENDER_SHADER: &'static str = r#"
         struct Uniforms {
-            stock_min: vec4<f32>,
-            stock_max: vec4<f32>,
-            tool_start: vec4<f32>,
-            tool_end: vec4<f32>,
-            tool_params: vec4<f32>,
+            stock_min:       vec4<f32>,
+            stock_max:       vec4<f32>,
+            tool_start:      vec4<f32>,
+            tool_end:        vec4<f32>,
+            tool_axis_start: vec4<f32>,
+            tool_axis_end:   vec4<f32>,
+            tool_params:     vec4<f32>,
         };
 
         struct ViewUniforms {
@@ -83,34 +114,35 @@ impl VoxelVolume {
 
         @vertex
         fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
-            var pos: vec3<f32>;
-            let v0 = vec3<f32>(0.0, 0.0, 0.0);
-            let v1 = vec3<f32>(1.0, 0.0, 0.0);
-            let v2 = vec3<f32>(1.0, 1.0, 0.0);
-            let v3 = vec3<f32>(0.0, 1.0, 0.0);
-            let v4 = vec3<f32>(0.0, 0.0, 1.0);
-            let v5 = vec3<f32>(1.0, 0.0, 1.0);
-            let v6 = vec3<f32>(1.0, 1.0, 1.0);
-            let v7 = vec3<f32>(0.0, 1.0, 1.0);
+            // Unit-cube corners (0..1 on each axis), then 36 indices forming
+            // 12 triangles — six faces with consistent winding so every face
+            // rasterises and the raymarcher can sample from any view angle.
+            var corners = array<vec3<f32>, 8>(
+                vec3<f32>(0.0, 0.0, 0.0),  // 0
+                vec3<f32>(1.0, 0.0, 0.0),  // 1
+                vec3<f32>(1.0, 1.0, 0.0),  // 2
+                vec3<f32>(0.0, 1.0, 0.0),  // 3
+                vec3<f32>(0.0, 0.0, 1.0),  // 4
+                vec3<f32>(1.0, 0.0, 1.0),  // 5
+                vec3<f32>(1.0, 1.0, 1.0),  // 6
+                vec3<f32>(0.0, 1.0, 1.0),  // 7
+            );
+            var idx = array<u32, 36>(
+                // -Z (bottom)
+                0u, 2u, 1u,   0u, 3u, 2u,
+                // +Z (top)
+                4u, 5u, 6u,   4u, 6u, 7u,
+                // -X (left)
+                0u, 4u, 7u,   0u, 7u, 3u,
+                // +X (right)
+                1u, 2u, 6u,   1u, 6u, 5u,
+                // -Y (front)
+                0u, 1u, 5u,   0u, 5u, 4u,
+                // +Y (back)
+                3u, 7u, 6u,   3u, 6u, 2u,
+            );
+            let pos = corners[idx[vid]];
 
-            switch (vid) {
-                case 0u, 5u, 34u: { pos = v0; }
-                case 1u, 11u, 32u: { pos = v1; }
-                case 2u, 3u, 8u: { pos = v2; }
-                case 4u, 20u, 29u: { pos = v3; }
-                case 18u, 23u, 35u: { pos = v4; }
-                case 6u, 12u, 31u: { pos = v5; }
-                case 9u, 10u, 16u, 26u: { pos = v6; }
-                case 15u, 22u, 28u: { pos = v7; }
-                // Remaining cases for the 36 vertices
-                case 7u, 17u: { pos = v5; }
-                case 13u, 19u: { pos = v4; }
-                case 14u, 21u: { pos = v7; }
-                case 24u, 25u: { pos = v2; }
-                case 27u, 30u: { pos = v6; }
-                default: { pos = v0; }
-            }
-            
             var out: VertexOutput;
             let world = u.stock_min.xyz + pos * (u.stock_max.xyz - u.stock_min.xyz);
             out.position = v.view_proj * vec4(world, 1.0);
@@ -118,30 +150,67 @@ impl VoxelVolume {
             return out;
         }
 
+        // Sample the voxel field at a world-space point. Returns 1.0 if the
+        // voxel is filled (still has material) or 0.0 if it's been carved /
+        // outside the stock volume.
+        fn voxel_at(p: vec3<f32>) -> f32 {
+            let n = (p - u.stock_min.xyz) / (u.stock_max.xyz - u.stock_min.xyz);
+            if (any(n < vec3(0.0)) || any(n > vec3(1.0))) {
+                return 0.0;
+            }
+            let d = vec3<f32>(textureDimensions(voxels));
+            let i = vec3<i32>(clamp(n, vec3(0.0), vec3(1.0)) * (d - 1.0));
+            return f32(textureLoad(voxels, i, 0).r);
+        }
+
+        // Surface normal from the voxel field gradient (central differences).
+        // The voxel field is 1 inside the stock, 0 outside, so the gradient
+        // points from solid into empty — that's the outward-facing surface
+        // normal we want for Lambertian shading.
+        fn voxel_normal(p: vec3<f32>) -> vec3<f32> {
+            let h = (u.stock_max.xyz - u.stock_min.xyz) / vec3<f32>(textureDimensions(voxels));
+            let dx = voxel_at(p + vec3(h.x, 0.0, 0.0)) - voxel_at(p - vec3(h.x, 0.0, 0.0));
+            let dy = voxel_at(p + vec3(0.0, h.y, 0.0)) - voxel_at(p - vec3(0.0, h.y, 0.0));
+            let dz = voxel_at(p + vec3(0.0, 0.0, h.z)) - voxel_at(p - vec3(0.0, 0.0, h.z));
+            let g = vec3(dx, dy, dz);
+            let len = length(g);
+            if (len < 1e-4) { return vec3(0.0, 0.0, 1.0); }
+            return -g / len;
+        }
+
         @fragment
         fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let ray_origin = v.camera_pos.xyz;
             let ray_dir = normalize(in.world_pos - ray_origin);
-            
+
+            // Step size proportional to one voxel — fewer skipped surfaces
+            // and the carved cavities show up at the right scale.
+            let dims = vec3<f32>(textureDimensions(voxels));
+            let voxel_size = length(u.stock_max.xyz - u.stock_min.xyz) / length(dims);
+            let ray_step = ray_dir * voxel_size;
+
             var p = in.world_pos;
-            // Adaptive step size based on resolution
-            let step_size = length(u.stock_max.xyz - u.stock_min.xyz) / 256.0;
-            let ray_step = ray_dir * step_size;
-            
-            for (var i = 0; i < 256; i++) {
-                let norm_pos = (p - u.stock_min.xyz) / (u.stock_max.xyz - u.stock_min.xyz);
-                if (any(norm_pos < vec3(-0.01)) || any(norm_pos > vec3(1.01))) { break; }
-                
-                let tex_dims = vec3<f32>(textureDimensions(voxels));
-                let val = textureLoad(voxels, vec3<i32>(clamp(norm_pos, vec3(0.0), vec3(1.0)) * (tex_dims - 1.0)), 0).r;
-                
-                if (val > 0u) {
-                    // Shading
+            for (var i = 0; i < 384; i = i + 1) {
+                let v_here = voxel_at(p);
+                if (v_here > 0.5) {
+                    // Lit shading using the gradient-based surface normal so
+                    // concave carve cavities render visibly distinct from the
+                    // convex outer faces — without this every voxel surface
+                    // had identical colour and the stock looked unchanged.
+                    let n = voxel_normal(p);
                     let l = normalize(v.light_dir.xyz);
-                    let diffuse = max(dot(vec3(0.0, 0.0, 1.0), l), 0.0) * 0.6 + 0.4;
-                    return vec4<f32>(vec3(0.8, 0.4, 0.1) * diffuse, 1.0);
+                    let lambert = max(dot(n, l), 0.0);
+                    // Two-tone: warm orange exterior, slightly cooler tone
+                    // inside cavities (where the normal flips toward camera).
+                    let view_dir = -ray_dir;
+                    let nv = max(dot(n, view_dir), 0.0);
+                    let base = mix(vec3(0.55, 0.30, 0.10), vec3(0.95, 0.55, 0.20), nv);
+                    let shade = base * (lambert * 0.75 + 0.25);
+                    return vec4(shade, 1.0);
                 }
-                p += ray_step;
+                p = p + ray_step;
+                let n = (p - u.stock_min.xyz) / (u.stock_max.xyz - u.stock_min.xyz);
+                if (any(n < vec3(-0.05)) || any(n > vec3(1.05))) { break; }
             }
             discard;
         }

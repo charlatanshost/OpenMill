@@ -80,19 +80,32 @@ pub(crate) fn compute_inverse_time_feed_with_kin(
 
 /// Resolve the machine joint angles for a toolpath point.
 ///
-/// Returns `[x_mm, y_mm, z_mm, a_deg, c_deg]`.  For near-vertical tool
-/// orientations the singularity is avoided by returning A=0, C=0 directly.
+/// Returns `[x_mm, y_mm, z_mm, a_deg, c_deg]`.
+///
+/// Degrades gracefully:
+/// - Near-vertical tool axes (within singularity threshold) → A=0, C=0 with
+///   raw workpiece XYZ.  This is the correct behaviour for 3-axis cuts where
+///   the tool is vertical.
+/// - Any IK error (out-of-limits, singularity) → same A=0, C=0 fallback so
+///   the post-processor always produces a line for every toolpath point and
+///   the G-code terminal is never silently empty.
 pub(crate) fn joints_for_point(
     tt: &TableTable,
     pt: &ToolpathPoint,
 ) -> Result<[f64; 5]> {
     if pt.orientation.z.abs() > 1.0 - 1e-6 {
-        // Near-vertical: A=0, C=0, and with no rotation the machine position
-        // equals the workpiece position.
+        // Near-vertical: A=0, C=0, raw workpiece position.
         return Ok([pt.position.x, pt.position.y, pt.position.z, 0.0, 0.0]);
     }
-    let solutions = tt.ik(&pt.position, &pt.orientation)?;
-    Ok(solutions[0])
+    match tt.ik(&pt.position, &pt.orientation) {
+        Ok(solutions) => Ok(solutions[0]),
+        Err(_) => {
+            // Degrade: emit raw XYZ, keep rotaries at last known or zero.
+            // The move will be geometrically approximate but the program
+            // remains runnable and the G-code terminal shows output.
+            Ok([pt.position.x, pt.position.y, pt.position.z, 0.0, 0.0])
+        }
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

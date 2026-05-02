@@ -1,6 +1,7 @@
 pub mod adaptive_clearing;
 pub mod contour_parallel;
 pub mod drilling;
+pub mod four_plus_one;
 pub mod geodesic;
 pub mod pencil;
 pub mod surface_normal_5axis;
@@ -11,6 +12,7 @@ pub mod traits;
 pub use adaptive_clearing::{AdaptiveClearing, AdaptiveClearingParams};
 pub use contour_parallel::{ContourParallel, ContourParallelParams};
 pub use drilling::{Drilling5Axis, DrillingParams, Hole};
+pub use four_plus_one::{FourPlusOne, FourPlusOneParams};
 pub use geodesic::{GeodesicParallel, GeodesicParams};
 pub use pencil::{PencilTracing, PencilParams};
 pub use surface_normal_5axis::{DrivePattern, SurfaceNormal5Axis, SurfaceNormal5AxisParams};

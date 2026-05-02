@@ -12,6 +12,7 @@ use crate::viewport::{OrbitCamera, Viewport};
 
 const STRATEGIES: &[&str] = &[
     "3+2 Indexed",
+    "4+1 Indexed",
     "Adaptive Clearing",
     "Contour Parallel",
     "Surface Normal 5-Axis",
@@ -52,6 +53,11 @@ pub struct OpenMillApp {
     sim_op_idx: Option<usize>,
     sim_collisions: Vec<nalgebra::Point3<f32>>,
 
+    /// Current 3D viewport mode. `Plan` shows the original part mesh for path
+    /// setup; `Simulation` hides the mesh and shows the carved voxel stock so
+    /// the user sees what material is left after each operation.
+    view_mode: ViewMode,
+
     // Tab system
     active_tab: AppTab,
 
@@ -64,6 +70,16 @@ pub enum AppTab {
     Manufacturing,
     Machine,
     Tools,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    /// Show the original part mesh — used for setting up jobs and reviewing
+    /// generated toolpaths.
+    Plan,
+    /// Hide the part mesh, show the voxel stock as it gets carved — used to
+    /// verify what material is left after each operation.
+    Simulation,
 }
 
 
@@ -90,6 +106,7 @@ impl OpenMillApp {
             sim_show_full_path: false,
             sim_op_idx: None,
             sim_collisions: Vec::new(),
+            view_mode: ViewMode::Plan,
             active_tab: AppTab::Manufacturing,
             machine_library: MachineLibrary::load("machines").unwrap_or_default(),
         };
@@ -144,7 +161,9 @@ impl eframe::App for OpenMillApp {
             ctx.request_repaint();
         }
 
-        if self.sim_progress > self.sim_prev_progress {
+        // Voxel carving and collision tracking only run in Simulation view —
+        // Plan view leaves the original mesh untouched.
+        if self.view_mode == ViewMode::Simulation && self.sim_progress > self.sim_prev_progress {
             let p1 = self.get_tool_pose_at(self.sim_prev_progress);
             let p2 = self.get_tool_pose_at(self.sim_progress);
             if let (Some(rs), Some(vp)) = (&self.render_state, &mut self.viewport) {
@@ -175,7 +194,10 @@ impl eframe::App for OpenMillApp {
         }
         self.sim_prev_progress = self.sim_progress;
 
-        // If we switched operations or need to catch up the stock state
+        // If we switched operations or need to catch up the stock state.
+        // Only do this work in Simulation mode — Plan mode never touches the
+        // voxel volume.
+        if self.view_mode == ViewMode::Simulation {
         if let Some(target_op_idx) = self.selected_op {
             if self.sim_op_idx != Some(target_op_idx) {
                 if let (Some(rs), Some(vp)) = (&self.render_state, &mut self.viewport) {
@@ -221,6 +243,7 @@ impl eframe::App for OpenMillApp {
                 }
             }
         }
+        } // end if Simulation view
 
         let sim_tool_data = if self.sim_progress > 0.0 || self.sim_playing {
             self.get_sim_tool_pose()
@@ -555,15 +578,80 @@ impl OpenMillApp {
                                 });
                         });
 
+                        // Feed / speed / coolant — preset-driven, op-overridable.
+                        ui.separator();
+                        ui.label("Feeds & Speeds:");
+
+                        // Preset picker (only when the op's tool has presets).
+                        let tool_for_op = self.job.tools.iter().find(|t| t.id == op.tool_id).cloned();
+                        if let Some(tool) = &tool_for_op {
+                            if !tool.presets.is_empty() {
+                                ui.horizontal(|ui| {
+                                    ui.label("Preset:");
+                                    egui::ComboBox::from_id_salt("op_preset")
+                                        .selected_text("(apply preset…)")
+                                        .show_ui(ui, |ui| {
+                                            for (p_idx, p) in tool.presets.iter().enumerate() {
+                                                if ui.selectable_label(false,
+                                                    format!("{} — S{:.0} F{:.0}", p.name, p.spindle_rpm, p.feed_rate)
+                                                ).clicked() {
+                                                    op.spindle_speed = p.spindle_rpm;
+                                                    op.feed_rate     = p.feed_rate;
+                                                    op.plunge_rate   = p.plunge_rate;
+                                                    op.coolant       = p.coolant;
+                                                    self.log.push(format!(
+                                                        "Applied preset \"{}\" (idx {}) to op \"{}\"",
+                                                        p.name, p_idx, op.name
+                                                    ));
+                                                }
+                                            }
+                                        });
+                                });
+                            }
+                        }
+
                         ui.horizontal(|ui| {
                             ui.label("Spindle:");
                             ui.add(egui::DragValue::new(&mut op.spindle_speed).speed(10.0).suffix(" RPM"));
                         });
+                        ui.horizontal(|ui| {
+                            ui.label("Feed:");
+                            ui.add(egui::DragValue::new(&mut op.feed_rate).speed(10.0).suffix(" mm/min"))
+                                .on_hover_text("Cutting feed rate. 0 = use strategy default.");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Plunge:");
+                            ui.add(egui::DragValue::new(&mut op.plunge_rate).speed(10.0).suffix(" mm/min"))
+                                .on_hover_text("Plunge feed rate (lead-in moves). 0 = use cutting feed × 0.5.");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Coolant:");
+                            egui::ComboBox::from_id_salt("op_coolant")
+                                .selected_text(op.coolant.label())
+                                .show_ui(ui, |ui| {
+                                    for c in [
+                                        Coolant::None, Coolant::Mist, Coolant::Flood,
+                                        Coolant::MistFlood, Coolant::Through,
+                                    ] {
+                                        ui.selectable_value(&mut op.coolant, c, c.label());
+                                    }
+                                });
+                        });
+
+                        ui.separator();
+                        ui.label("Custom op G-code (run after spindle/coolant on):");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut op.gcode_command)
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("e.g. G43 H1   (tool length offset)"),
+                        );
 
                         // Strategy-specific params
                         ui.separator();
                         ui.label("Parameters:");
-                        show_strategy_params(ui, op);
+                        let model_aabb = self.model.as_ref().map(|m| m.aabb.clone());
+                        show_strategy_params(ui, op, model_aabb.as_ref());
 
                         ui.separator();
 
@@ -595,13 +683,24 @@ impl OpenMillApp {
 
             // Add operation
             if ui.button("Add Operation").clicked() {
-                let next_tool = self.job.tools.first().map(|t| t.id).unwrap_or(1);
+                let tool = self.job.tools.first().cloned();
+                let next_tool = tool.as_ref().map(|t| t.id).unwrap_or(1);
+                // Seed feeds/coolant from the tool's default preset if it has one.
+                let (rpm, feed, plunge, coolant) = tool
+                    .as_ref()
+                    .and_then(|t| t.default_preset.and_then(|i| t.presets.get(i)))
+                    .map(|p| (p.spindle_rpm, p.feed_rate, p.plunge_rate, p.coolant))
+                    .unwrap_or((10000.0, 0.0, 0.0, Coolant::None));
                 let op = Operation {
                     name: format!("Op {}", self.job.operations.len() + 1),
                     tool_id: next_tool,
                     strategy: "3+2 Indexed".into(),
                     params: default_params_for("3+2 Indexed"),
-                    spindle_speed: 10000.0,
+                    spindle_speed: rpm,
+                    feed_rate: feed,
+                    plunge_rate: plunge,
+                    coolant,
+                    gcode_command: String::new(),
                     enabled: true,
                 };
                 self.job.operations.push(op);
@@ -692,7 +791,13 @@ impl OpenMillApp {
             if let (Some(rs), Some(vp)) = (&self.render_state, &mut self.viewport) {
                 let w = (size.x as u32).max(1);
                 let h = (size.y as u32).max(1);
-                vp.render(rs, &self.camera, w, h, self.sim_progress, self.sim_show_full_path);
+                let show_mesh  = self.view_mode == ViewMode::Plan;
+                let show_voxel = self.view_mode == ViewMode::Simulation;
+                vp.render(
+                    rs, &self.camera, w, h,
+                    self.sim_progress, self.sim_show_full_path,
+                    show_mesh, show_voxel,
+                );
 
                 ui.painter().image(
                     vp.texture_id,
@@ -735,26 +840,65 @@ impl OpenMillApp {
             .resizable(true)
             .default_height(100.0)
             .show(ctx, |ui| {
+                // ── View mode (always visible) ──────────────────────────
+                ui.horizontal(|ui| {
+                    ui.heading("View:");
+                    let was_plan = self.view_mode == ViewMode::Plan;
+                    if ui.selectable_label(was_plan, "🧭 Plan").on_hover_text(
+                        "Show the original part mesh — best for setting up tools and reviewing toolpaths."
+                    ).clicked() && !was_plan {
+                        self.view_mode = ViewMode::Plan;
+                        // Stop the sim playhead — Plan view doesn't carve.
+                        self.sim_playing = false;
+                    }
+                    let was_sim = self.view_mode == ViewMode::Simulation;
+                    if ui.selectable_label(was_sim, "🛠 Simulation").on_hover_text(
+                        "Hide the part mesh and show the voxel stock as it gets carved."
+                    ).clicked() && !was_sim {
+                        self.view_mode = ViewMode::Simulation;
+                        // Force a fresh voxel rebuild from the start of the
+                        // current op (the update loop replays prior ops next
+                        // frame because sim_op_idx no longer matches).
+                        self.sim_op_idx = None;
+                        self.sim_progress = 0.0;
+                        self.sim_prev_progress = 0.0;
+                        if let (Some(rs), Some(vp)) = (&self.render_state, &mut self.viewport) {
+                            vp.reset_voxel(&rs.queue);
+                            vp.upload_collisions(&rs.device, &[]);
+                        }
+                        self.sim_collisions.clear();
+                    }
+                });
+                ui.separator();
+
                 if let Some(op_idx) = self.selected_op {
                     if op_idx < self.toolpaths.len() && !self.toolpaths[op_idx].is_empty() {
                         ui.horizontal(|ui| {
                             ui.heading("Simulation");
-                            if ui.button(if self.sim_playing { "Pause" } else { "Play" }).clicked() {
-                                self.sim_playing = !self.sim_playing;
-                            }
-                            if ui.button("Reset").clicked() {
-                                self.sim_progress = 0.0;
-                                self.sim_prev_progress = 0.0;
-                                self.sim_playing = false;
-                                if let (Some(rs), Some(vp)) = (&self.render_state, &mut self.viewport) {
-                                    vp.reset_voxel(&rs.queue);
-                                    vp.upload_collisions(&rs.device, &[]);
+                            let sim_active = self.view_mode == ViewMode::Simulation;
+                            ui.add_enabled_ui(sim_active, |ui| {
+                                if ui.button(if self.sim_playing { "Pause" } else { "Play" }).clicked() {
+                                    self.sim_playing = !self.sim_playing;
                                 }
-                                self.sim_collisions.clear();
+                                if ui.button("Reset").clicked() {
+                                    self.sim_progress = 0.0;
+                                    self.sim_prev_progress = 0.0;
+                                    self.sim_playing = false;
+                                    if let (Some(rs), Some(vp)) = (&self.render_state, &mut self.viewport) {
+                                        vp.reset_voxel(&rs.queue);
+                                        vp.upload_collisions(&rs.device, &[]);
+                                    }
+                                    // Force rebuild of prior-op carving on next frame.
+                                    self.sim_op_idx = None;
+                                    self.sim_collisions.clear();
+                                }
+                                ui.add(egui::Slider::new(&mut self.sim_progress, 0.0..=1.0).text("Progress"));
+                                ui.add(egui::Slider::new(&mut self.sim_speed, 0.1..=5.0).text("Speed"));
+                                ui.checkbox(&mut self.sim_show_full_path, "Show Full Path");
+                            });
+                            if !sim_active {
+                                ui.weak("(switch to Simulation view to carve)");
                             }
-                            ui.add(egui::Slider::new(&mut self.sim_progress, 0.0..=1.0).text("Progress"));
-                            ui.add(egui::Slider::new(&mut self.sim_speed, 0.1..=5.0).text("Speed"));
-                            ui.checkbox(&mut self.sim_show_full_path, "Show Full Path");
                         });
                         ui.separator();
                     }
@@ -980,11 +1124,8 @@ impl OpenMillApp {
     }
 
     fn action_export_gcode(&mut self, post: &dyn PostProcessor) {
-        let all_paths: Vec<&Toolpath> = self.toolpaths.iter()
-            .flat_map(|v| v.iter())
-            .collect();
-
-        if all_paths.is_empty() {
+        let any_paths = self.toolpaths.iter().any(|v| !v.is_empty());
+        if !any_paths {
             self.log.push("No toolpaths generated. Generate toolpaths first.".into());
             return;
         }
@@ -998,25 +1139,57 @@ impl OpenMillApp {
         let Some(path) = file else { return };
 
         let config = self.job.machine.post_config.clone();
-
         let mut output = post.header(&config);
 
-        for tp in &all_paths {
-            // Find matching tool for tool change.
-            if let Some(tool) = self.job.tools.iter().find(|t| t.id == tp.tool_id) {
-                output.push_str(&post.tool_change(tool));
+        // Iterate operations in order. Emit a tool change whenever the active
+        // tool changes, then op preamble → all toolpaths for that op → op
+        // postamble. This matches the documented PostProcessor contract.
+        let mut active_tool_id: Option<u32> = None;
+
+        for (op_idx, op) in self.job.operations.iter().enumerate() {
+            if op_idx >= self.toolpaths.len() || self.toolpaths[op_idx].is_empty() {
+                continue;
             }
-            match post.process_toolpath(tp, &self.job.machine) {
-                Ok(gcode_lines) => {
-                    for (line, _) in gcode_lines {
-                        output.push_str(&line);
+            let Some(tool) = self.job.tools.iter().find(|t| t.id == op.tool_id) else {
+                self.log.push(format!("Op \"{}\": tool T{} not found, skipped.", op.name, op.tool_id));
+                continue;
+            };
+
+            if active_tool_id != Some(tool.id) {
+                output.push_str(&post.tool_change(tool));
+                active_tool_id = Some(tool.id);
+            }
+
+            output.push_str(&post.op_preamble(op, tool));
+
+            let plunge = if op.plunge_rate > 0.0 {
+                op.plunge_rate
+            } else if op.feed_rate > 0.0 {
+                op.feed_rate * 0.5
+            } else {
+                0.0
+            };
+
+            for tp in &self.toolpaths[op_idx] {
+                let posted_tp = if op.feed_rate > 0.0 || plunge > 0.0 {
+                    tp.with_op_feeds(op.feed_rate, plunge)
+                } else {
+                    tp.clone()
+                };
+                match post.process_toolpath(&posted_tp, &self.job.machine) {
+                    Ok(gcode_lines) => {
+                        for (line, _) in gcode_lines {
+                            output.push_str(&line);
+                        }
+                    }
+                    Err(e) => {
+                        self.log.push(format!("Post-process error: {e}"));
+                        return;
                     }
                 }
-                Err(e) => {
-                    self.log.push(format!("Post-process error: {e}"));
-                    return;
-                }
             }
+
+            output.push_str(&post.op_postamble(op));
         }
 
         output.push_str(&post.footer());
@@ -1063,6 +1236,16 @@ impl OpenMillApp {
                     serde_json::from_value(op.params.clone()).unwrap_or_default();
                 ThreePlusTwo.generate(model, tool, &self.job.machine, &params)
             }
+            "4+1 Indexed" => {
+                let params: FourPlusOneParams =
+                    serde_json::from_value(op.params.clone()).unwrap_or_default();
+                FourPlusOne.generate(model, tool, &self.job.machine, &params)
+            }
+            "Adaptive Clearing" => {
+                let params: AdaptiveClearingParams =
+                    serde_json::from_value(op.params.clone()).unwrap_or_default();
+                AdaptiveClearing.generate(model, tool, &self.job.machine, &params)
+            }
             "Surface Normal 5-Axis" => {
                 let params: SurfaceNormal5AxisParams =
                     serde_json::from_value(op.params.clone()).unwrap_or_default();
@@ -1072,6 +1255,11 @@ impl OpenMillApp {
                 let params: ContourParallelParams =
                     serde_json::from_value(op.params.clone()).unwrap_or_default();
                 ContourParallel.generate(model, tool, &self.job.machine, &params)
+            }
+            "Swarf 5-Axis" => {
+                let params: Swarf5AxisParams =
+                    serde_json::from_value(op.params.clone()).unwrap_or_default();
+                Swarf5Axis.generate(model, tool, &self.job.machine, &params)
             }
             "Geodesic Parallel" => {
                 let params: GeodesicParams =
@@ -1117,13 +1305,45 @@ impl OpenMillApp {
     fn update_sim_gcode(&mut self) {
         self.sim_gcode.clear();
         let Some(idx) = self.selected_op else { return };
-        if idx >= self.toolpaths.len() { return; }
+        if idx >= self.toolpaths.len() || idx >= self.job.operations.len() { return; }
 
         let post = get_post(&self.job.machine.post_processor);
-        for tp in &self.toolpaths[idx] {
-            if let Ok(lines) = post.process_toolpath(tp, &self.job.machine) {
-                self.sim_gcode.extend(lines);
+        let op = &self.job.operations[idx];
+        let tool = self.job.tools.iter().find(|t| t.id == op.tool_id);
+
+        // Op preamble (spindle on, coolant on, custom op gcode).
+        if let Some(t) = tool {
+            for line in post.op_preamble(op, t).lines() {
+                self.sim_gcode.push((format!("{line}\n"), None));
             }
+        }
+
+        let plunge = if op.plunge_rate > 0.0 {
+            op.plunge_rate
+        } else if op.feed_rate > 0.0 {
+            op.feed_rate * 0.5
+        } else {
+            0.0
+        };
+
+        for (tp_idx, tp) in self.toolpaths[idx].iter().enumerate() {
+            let posted_tp = if op.feed_rate > 0.0 || plunge > 0.0 {
+                tp.with_op_feeds(op.feed_rate, plunge)
+            } else {
+                tp.clone()
+            };
+            match post.process_toolpath(&posted_tp, &self.job.machine) {
+                Ok(lines) => self.sim_gcode.extend(lines),
+                Err(e) => self.log.push(format!(
+                    "Post-processor error on toolpath {tp_idx} (\"{}\"): {e}",
+                    tp.name
+                )),
+            }
+        }
+
+        // Op postamble (coolant off).
+        for line in post.op_postamble(op).lines() {
+            self.sim_gcode.push((format!("{line}\n"), None));
         }
     }
 
@@ -1142,6 +1362,7 @@ impl OpenMillApp {
 fn default_params_for(strategy: &str) -> serde_json::Value {
     match strategy {
         "3+2 Indexed" => serde_json::to_value(ThreePlusTwoParams::default()).unwrap(),
+        "4+1 Indexed" => serde_json::to_value(FourPlusOneParams::default()).unwrap(),
         "Adaptive Clearing" => serde_json::to_value(AdaptiveClearingParams::default()).unwrap(),
         "Contour Parallel" => serde_json::to_value(ContourParallelParams::default()).unwrap(),
         "Surface Normal 5-Axis" => serde_json::to_value(SurfaceNormal5AxisParams::default()).unwrap(),
@@ -1153,7 +1374,11 @@ fn default_params_for(strategy: &str) -> serde_json::Value {
     }
 }
 
-fn show_strategy_params(ui: &mut egui::Ui, op: &mut Operation) {
+fn show_strategy_params(
+    ui: &mut egui::Ui,
+    op: &mut Operation,
+    model_aabb: Option<&parry3d::bounding_volume::Aabb>,
+) {
     // Deserialize, show editors, serialize back on change.
     match op.strategy.as_str() {
         "3+2 Indexed" => {
@@ -1162,6 +1387,24 @@ fn show_strategy_params(ui: &mut egui::Ui, op: &mut Operation) {
             let mut changed = false;
             changed |= drag(ui, "A angle", &mut p.a_deg, 0.5, "deg");
             changed |= drag(ui, "C angle", &mut p.c_deg, 0.5, "deg");
+            changed |= drag(ui, "Step-down", &mut p.step_down, 0.1, "mm");
+            changed |= drag(ui, "Step-over", &mut p.step_over, 0.01, "");
+            changed |= drag(ui, "Feed rate", &mut p.feed_rate, 10.0, "mm/min");
+            if changed {
+                op.params = serde_json::to_value(&p).unwrap();
+            }
+        }
+        "4+1 Indexed" => {
+            let mut p: FourPlusOneParams =
+                serde_json::from_value(op.params.clone()).unwrap_or_default();
+            let mut changed = false;
+            changed |= drag(ui, "A angle (fixed)", &mut p.a_deg, 0.5, "deg");
+            ui.separator();
+            ui.weak("C axis — stepped between passes:");
+            changed |= drag(ui, "C start", &mut p.c_start_deg, 0.5, "deg");
+            changed |= drag(ui, "C step", &mut p.c_step_deg, 0.5, "deg");
+            changed |= drag(ui, "C range", &mut p.c_range_deg, 1.0, "deg");
+            ui.separator();
             changed |= drag(ui, "Step-down", &mut p.step_down, 0.1, "mm");
             changed |= drag(ui, "Step-over", &mut p.step_over, 0.01, "");
             changed |= drag(ui, "Feed rate", &mut p.feed_rate, 10.0, "mm/min");
@@ -1265,21 +1508,72 @@ fn show_strategy_params(ui: &mut egui::Ui, op: &mut Operation) {
             let mut p: DrillingParams =
                 serde_json::from_value(op.params.clone()).unwrap_or_default();
             let mut changed = false;
-            ui.label(format!("Holes: {}", p.holes.len()));
-            if ui.button("Clear Holes").clicked() {
-                p.holes.clear();
-                changed = true;
-            }
-            if p.holes.is_empty() && ui.button("Add Test Hole").clicked() {
-                p.holes.push(openmill_core::strategies::drilling::Hole {
-                    position: nalgebra::Point3::new(0.0, 0.0, 10.0),
-                    axis: nalgebra::Vector3::z(),
-                    depth: 10.0,
+
+            ui.horizontal(|ui| {
+                ui.label(format!("Holes: {}", p.holes.len()));
+                if ui.button("Add Hole").clicked() {
+                    // Default a new hole to the top-centre of the loaded model
+                    // (or origin if no model is loaded), pointing -Z.
+                    let (pos, depth) = match model_aabb {
+                        Some(aabb) => {
+                            let cx = (aabb.mins.x + aabb.maxs.x) as f64 * 0.5;
+                            let cy = (aabb.mins.y + aabb.maxs.y) as f64 * 0.5;
+                            let top_z = aabb.maxs.z as f64;
+                            let model_h = (aabb.maxs.z - aabb.mins.z) as f64;
+                            (
+                                nalgebra::Point3::new(cx, cy, top_z),
+                                model_h.max(5.0),
+                            )
+                        }
+                        None => (nalgebra::Point3::new(0.0, 0.0, 10.0), 10.0),
+                    };
+                    p.holes.push(openmill_core::strategies::drilling::Hole {
+                        position: pos,
+                        axis: nalgebra::Vector3::new(0.0, 0.0, -1.0),
+                        depth,
+                    });
+                    changed = true;
+                }
+                if !p.holes.is_empty() && ui.button("Clear All").clicked() {
+                    p.holes.clear();
+                    changed = true;
+                }
+            });
+
+            let mut remove_hole = None;
+            for (h_idx, hole) in p.holes.iter_mut().enumerate() {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(format!("Hole {}", h_idx + 1));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("🗑").clicked() {
+                                remove_hole = Some(h_idx);
+                            }
+                        });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Pos:");
+                        if ui.add(egui::DragValue::new(&mut hole.position.x).speed(0.5).prefix("X ")).changed() { changed = true; }
+                        if ui.add(egui::DragValue::new(&mut hole.position.y).speed(0.5).prefix("Y ")).changed() { changed = true; }
+                        if ui.add(egui::DragValue::new(&mut hole.position.z).speed(0.5).prefix("Z ")).changed() { changed = true; }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Axis:");
+                        if ui.add(egui::DragValue::new(&mut hole.axis.x).speed(0.05).prefix("X ")).changed() { changed = true; }
+                        if ui.add(egui::DragValue::new(&mut hole.axis.y).speed(0.05).prefix("Y ")).changed() { changed = true; }
+                        if ui.add(egui::DragValue::new(&mut hole.axis.z).speed(0.05).prefix("Z ")).changed() { changed = true; }
+                    });
+                    changed |= drag(ui, "Depth", &mut hole.depth, 0.1, "mm");
                 });
+            }
+            if let Some(i) = remove_hole {
+                p.holes.remove(i);
                 changed = true;
             }
 
+            ui.separator();
             changed |= drag(ui, "Feed rate", &mut p.feed_rate, 10.0, "mm/min");
+            changed |= drag(ui, "Dwell", &mut p.dwell, 0.1, "s");
             if changed {
                 op.params = serde_json::to_value(&p).unwrap();
             }
@@ -1541,6 +1835,7 @@ impl OpenMillApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let mut save_requested = false;
+            let mut delete_requested = false;
             if let Some(idx) = self.selected_tool {
                 if idx < self.job.tools.len() {
                     ui.columns(2, |cols| {
@@ -1652,6 +1947,128 @@ impl OpenMillApp {
                                 ui.label("Shank diameter:");
                                 ui.add(egui::DragValue::new(&mut tool.shank_diameter).speed(0.1).suffix(" mm")).changed()
                             }).inner;
+                            ge_changed |= ui.horizontal(|ui| {
+                                ui.label("Flutes:");
+                                let mut f = tool.flutes as f64;
+                                let r = ui.add(egui::DragValue::new(&mut f).speed(1.0).range(1.0..=12.0));
+                                if r.changed() { tool.flutes = f.max(1.0) as u32; }
+                                r.changed()
+                            }).inner;
+
+                            // ── Feed-and-speed presets ────────────────────────
+                            ui.separator();
+                            ui.collapsing(format!("Feed/Speed Presets ({})", tool.presets.len()), |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui.button("➕ Add Empty").clicked() {
+                                        let d = tool.shape.diameter();
+                                        tool.presets.push(FeedSpeedPreset {
+                                            name: "New Preset".into(),
+                                            material: String::new(),
+                                            spindle_rpm: 10000.0,
+                                            feed_rate: 0.05 * tool.flutes as f64 * 10000.0,
+                                            plunge_rate: 200.0,
+                                            coolant: Coolant::None,
+                                            notes: String::new(),
+                                        });
+                                        if tool.default_preset.is_none() {
+                                            tool.default_preset = Some(tool.presets.len() - 1);
+                                        }
+                                        ge_changed = true;
+                                        let _ = d; // silence unused
+                                    }
+                                    if ui.button("✨ Load Starter Set").on_hover_text(
+                                        "Replace presets with a starter set computed from this tool's diameter and flute count."
+                                    ).clicked() {
+                                        tool.presets = starter_presets_for(tool.shape.diameter(), tool.flutes);
+                                        tool.default_preset = if tool.presets.is_empty() { None } else { Some(0) };
+                                        ge_changed = true;
+                                    }
+                                    if !tool.presets.is_empty() && ui.button("🗑 Clear All").clicked() {
+                                        tool.presets.clear();
+                                        tool.default_preset = None;
+                                        ge_changed = true;
+                                    }
+                                });
+
+                                let mut to_remove: Option<usize> = None;
+                                let mut new_default: Option<usize> = None;
+                                for (p_idx, preset) in tool.presets.iter_mut().enumerate() {
+                                    let is_default = tool.default_preset == Some(p_idx);
+                                    ui.group(|ui| {
+                                        ui.horizontal(|ui| {
+                                            if ui.selectable_label(is_default, "★").on_hover_text("Set as default preset").clicked() {
+                                                new_default = Some(p_idx);
+                                                ge_changed = true;
+                                            }
+                                            ge_changed |= ui.text_edit_singleline(&mut preset.name).changed();
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                if ui.small_button("🗑").clicked() {
+                                                    to_remove = Some(p_idx);
+                                                }
+                                            });
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.label("Material:");
+                                            ge_changed |= ui.text_edit_singleline(&mut preset.material).changed();
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.label("Spindle:");
+                                            ge_changed |= ui.add(egui::DragValue::new(&mut preset.spindle_rpm).speed(10.0).suffix(" RPM")).changed();
+                                            ui.label("Feed:");
+                                            ge_changed |= ui.add(egui::DragValue::new(&mut preset.feed_rate).speed(10.0).suffix(" mm/min")).changed();
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.label("Plunge:");
+                                            ge_changed |= ui.add(egui::DragValue::new(&mut preset.plunge_rate).speed(10.0).suffix(" mm/min")).changed();
+                                            ui.label("Coolant:");
+                                            egui::ComboBox::from_id_salt(format!("preset_coolant_{p_idx}"))
+                                                .selected_text(preset.coolant.label())
+                                                .show_ui(ui, |ui| {
+                                                    for c in [Coolant::None, Coolant::Mist, Coolant::Flood, Coolant::MistFlood, Coolant::Through] {
+                                                        if ui.selectable_value(&mut preset.coolant, c, c.label()).changed() {
+                                                            ge_changed = true;
+                                                        }
+                                                    }
+                                                });
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.label("Notes:");
+                                            ge_changed |= ui.text_edit_singleline(&mut preset.notes).changed();
+                                        });
+                                    });
+                                }
+                                if let Some(i) = to_remove {
+                                    tool.presets.remove(i);
+                                    // Fix up default index after removal.
+                                    tool.default_preset = match tool.default_preset {
+                                        Some(d) if d == i => if tool.presets.is_empty() { None } else { Some(0) },
+                                        Some(d) if d > i => Some(d - 1),
+                                        other => other,
+                                    };
+                                    ge_changed = true;
+                                }
+                                if let Some(i) = new_default {
+                                    tool.default_preset = Some(i);
+                                }
+                            });
+
+                            // ── Tool-change G-code ─────────────────────────────
+                            ui.separator();
+                            ui.label("Tool-change G-code (runs after M6):");
+                            let mut tc_text = tool.tool_change_gcode.clone().unwrap_or_default();
+                            if ui.add(
+                                egui::TextEdit::multiline(&mut tc_text)
+                                    .desired_rows(2)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("e.g. G43 H1   (apply tool-length offset)"),
+                            ).changed() {
+                                tool.tool_change_gcode = if tc_text.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(tc_text)
+                                };
+                                ge_changed = true;
+                            }
 
                             if ge_changed {
                                 save_requested = true;
@@ -1659,8 +2076,11 @@ impl OpenMillApp {
 
                             ui.add_space(20.0);
                             if ui.button("🗑 Delete Tool").clicked() {
-                                self.job.tools.remove(idx);
-                                self.selected_tool = None;
+                                // Defer the removal until after both columns
+                                // have finished borrowing `self.job.tools[idx]`
+                                // — otherwise the right-column profile preview
+                                // panics with index-out-of-bounds.
+                                delete_requested = true;
                             }
                         });
 
@@ -1669,101 +2089,273 @@ impl OpenMillApp {
                             ui.heading("Tool Profile Preview");
                             ui.separator();
                             let tool = &self.job.tools[idx];
-                            
-                            let (rect, _response) = ui.allocate_at_least(egui::vec2(ui.available_width(), 400.0), egui::Sense::hover());
+
+                            let (rect, _response) = ui.allocate_at_least(
+                                egui::vec2(ui.available_width(), 400.0),
+                                egui::Sense::hover(),
+                            );
                             let painter = ui.painter_at(rect);
-                            
-                            // Simple 2D profile draw
-                            let center = rect.center();
-                            let scale = 5.0; // pixels per mm
-                            
-                            let d = tool.shape.diameter() as f32;
+
+                            let d  = tool.shape.diameter()    as f32;
                             let fl = tool.shape.flute_length() as f32;
-                            let ol = tool.overall_length as f32;
-                            
-                            // Draw shank
+                            let ol = tool.overall_length      as f32;
+                            let shank_d = tool.shank_diameter as f32;
+
+                            // ── Auto-scale: fit overall length and the widest
+                            // radial dimension into the rect with margin so the
+                            // preview always reflects parameter edits even when
+                            // the tool is very small or very tall. ────────────
+                            let max_radius = (d * 0.5)
+                                .max(shank_d * 0.5)
+                                .max(match &tool.shape {
+                                    ToolShape::Lollipop { diameter, .. } => *diameter as f32 * 0.5,
+                                    ToolShape::Dovetail { diameter, .. } => *diameter as f32 * 0.5,
+                                    ToolShape::ChamferMill { diameter, .. } => *diameter as f32 * 0.5,
+                                    ToolShape::TaperedMill { .. } => d * 0.5,
+                                    _ => 0.0,
+                                })
+                                .max(0.5);
+                            let total_h = ol.max(fl + 1.0);
+
+                            let avail_w = rect.width() - 24.0;
+                            let avail_h = rect.height() - 24.0;
+                            let scale_x = avail_w / (max_radius * 2.0);
+                            let scale_y = avail_h / total_h;
+                            let scale   = scale_x.min(scale_y).max(0.1);
+
+                            // Anchor the cutting tip near the bottom of the rect
+                            // so the shank grows upward into the available area.
+                            let center = egui::pos2(rect.center().x, rect.bottom() - 12.0);
+
+                            let cyan = egui::Color32::from_rgb(0, 180, 255);
+                            let dark = egui::Color32::from_gray(80);
+
+                            // Shank: from the top of the cutting flutes up to overall length.
+                            let shank_top = center + egui::vec2(0.0, -ol * scale);
+                            let flute_top = center + egui::vec2(0.0, -fl * scale);
                             painter.rect_filled(
                                 egui::Rect::from_min_max(
-                                    center + egui::vec2(-tool.shank_diameter as f32 * 0.5 * scale, -ol * scale),
-                                    center + egui::vec2(tool.shank_diameter as f32 * 0.5 * scale, -fl * scale)
+                                    shank_top + egui::vec2(-shank_d * 0.5 * scale, 0.0),
+                                    flute_top + egui::vec2( shank_d * 0.5 * scale, 0.0),
                                 ),
                                 0.0,
-                                egui::Color32::from_gray(80)
+                                dark,
                             );
-                            
-                            // Draw cutter based on shape
+
+                            // Cutter shape
                             match &tool.shape {
-                                ToolShape::FlatEnd { diameter, .. } | ToolShape::BullNose { diameter, .. } => {
+                                ToolShape::FlatEnd { diameter, .. } => {
+                                    let r = *diameter as f32 * 0.5 * scale;
                                     painter.rect_filled(
                                         egui::Rect::from_min_max(
-                                            center + egui::vec2(-*diameter as f32 * 0.5 * scale, -fl * scale),
-                                            center + egui::vec2(*diameter as f32 * 0.5 * scale, 0.0)
+                                            center + egui::vec2(-r, -fl * scale),
+                                            center + egui::vec2( r, 0.0),
                                         ),
                                         0.0,
-                                        egui::Color32::from_rgb(0, 180, 255)
+                                        cyan,
                                     );
+                                }
+                                ToolShape::BullNose { diameter, corner_radius, .. } => {
+                                    let r  = *diameter as f32 * 0.5 * scale;
+                                    let cr = (*corner_radius as f32 * scale).min(r);
+                                    // Shaft above the corner
+                                    painter.rect_filled(
+                                        egui::Rect::from_min_max(
+                                            center + egui::vec2(-r, -fl * scale),
+                                            center + egui::vec2( r, -cr),
+                                        ),
+                                        0.0,
+                                        cyan,
+                                    );
+                                    // Flat between the two corner radii
+                                    let inner = r - cr;
+                                    painter.rect_filled(
+                                        egui::Rect::from_min_max(
+                                            center + egui::vec2(-inner, -cr),
+                                            center + egui::vec2( inner, 0.0),
+                                        ),
+                                        0.0,
+                                        cyan,
+                                    );
+                                    // Corner-radius circles
+                                    painter.circle_filled(center + egui::vec2(-inner, -cr), cr, cyan);
+                                    painter.circle_filled(center + egui::vec2( inner, -cr), cr, cyan);
                                 }
                                 ToolShape::BallEnd { diameter, .. } => {
                                     let r = *diameter as f32 * 0.5 * scale;
-                                    painter.rect_filled(egui::Rect::from_min_max(center + egui::vec2(-r, -fl*scale), center + egui::vec2(r, -r)), 0.0, egui::Color32::from_rgb(0, 180, 255));
-                                    painter.circle_filled(center + egui::vec2(0.0, -r), r, egui::Color32::from_rgb(0, 180, 255));
+                                    painter.rect_filled(
+                                        egui::Rect::from_min_max(
+                                            center + egui::vec2(-r, -fl * scale),
+                                            center + egui::vec2( r, -r),
+                                        ),
+                                        0.0,
+                                        cyan,
+                                    );
+                                    painter.circle_filled(center + egui::vec2(0.0, -r), r, cyan);
                                 }
                                 ToolShape::Drill { diameter, point_angle, .. } => {
                                     let r = *diameter as f32 * 0.5 * scale;
-                                    let tip_h = r / ((*point_angle as f32 * 0.5).to_radians().tan());
-                                    painter.rect_filled(egui::Rect::from_min_max(center + egui::vec2(-r, -fl*scale), center + egui::vec2(r, -tip_h)), 0.0, egui::Color32::from_rgb(0, 180, 255));
+                                    let half = (*point_angle as f32 * 0.5).to_radians();
+                                    let tan_half = half.tan().max(0.05);
+                                    let tip_h = (r / tan_half).min(fl * scale);
+                                    painter.rect_filled(
+                                        egui::Rect::from_min_max(
+                                            center + egui::vec2(-r, -fl * scale),
+                                            center + egui::vec2( r, -tip_h),
+                                        ),
+                                        0.0,
+                                        cyan,
+                                    );
                                     painter.add(egui::Shape::convex_polygon(
-                                        vec![center + egui::vec2(-r, -tip_h), center + egui::vec2(r, -tip_h), center],
-                                        egui::Color32::from_rgb(0, 180, 255),
-                                        egui::Stroke::NONE
+                                        vec![
+                                            center + egui::vec2(-r, -tip_h),
+                                            center + egui::vec2( r, -tip_h),
+                                            center,
+                                        ],
+                                        cyan,
+                                        egui::Stroke::NONE,
                                     ));
                                 }
                                 ToolShape::ChamferMill { tip_diameter, diameter, .. } => {
-                                    let r_tip = *tip_diameter as f32 * 0.5 * scale;
-                                    let r_major = *diameter as f32 * 0.5 * scale;
+                                    let r_tip   = *tip_diameter as f32 * 0.5 * scale;
+                                    let r_major = *diameter     as f32 * 0.5 * scale;
                                     painter.add(egui::Shape::convex_polygon(
-                                        vec![center + egui::vec2(-r_major, -fl*scale), center + egui::vec2(r_major, -fl*scale), center + egui::vec2(r_tip, 0.0), center + egui::vec2(-r_tip, 0.0)],
-                                        egui::Color32::from_rgb(0, 180, 255),
-                                        egui::Stroke::NONE
+                                        vec![
+                                            center + egui::vec2(-r_major, -fl * scale),
+                                            center + egui::vec2( r_major, -fl * scale),
+                                            center + egui::vec2( r_tip,    0.0),
+                                            center + egui::vec2(-r_tip,    0.0),
+                                        ],
+                                        cyan,
+                                        egui::Stroke::NONE,
                                     ));
                                 }
                                 ToolShape::TaperedMill { tip_diameter, .. } => {
-                                    let r_tip = *tip_diameter as f32 * 0.5 * scale;
+                                    let r_tip   = *tip_diameter as f32 * 0.5 * scale;
                                     let r_major = d * 0.5 * scale;
                                     painter.add(egui::Shape::convex_polygon(
-                                        vec![center + egui::vec2(-r_major, -fl*scale), center + egui::vec2(r_major, -fl*scale), center + egui::vec2(r_tip, 0.0), center + egui::vec2(-r_tip, 0.0)],
-                                        egui::Color32::from_rgb(0, 180, 255),
-                                        egui::Stroke::NONE
+                                        vec![
+                                            center + egui::vec2(-r_major, -fl * scale),
+                                            center + egui::vec2( r_major, -fl * scale),
+                                            center + egui::vec2( r_tip,    0.0),
+                                            center + egui::vec2(-r_tip,    0.0),
+                                        ],
+                                        cyan,
+                                        egui::Stroke::NONE,
                                     ));
                                 }
                                 ToolShape::Lollipop { diameter, neck_diameter, .. } => {
                                     let r_head = *diameter as f32 * 0.5 * scale;
                                     let r_neck = *neck_diameter as f32 * 0.5 * scale;
-                                    painter.rect_filled(egui::Rect::from_min_max(center + egui::vec2(-r_neck, -fl*scale), center + egui::vec2(r_neck, -r_head)), 0.0, egui::Color32::from_gray(100));
-                                    painter.circle_filled(center + egui::vec2(0.0, -r_head), r_head, egui::Color32::from_rgb(0, 180, 255));
+                                    // Neck rises from the equator of the head to the top of the flutes.
+                                    painter.rect_filled(
+                                        egui::Rect::from_min_max(
+                                            center + egui::vec2(-r_neck, -fl * scale),
+                                            center + egui::vec2( r_neck, -r_head),
+                                        ),
+                                        0.0,
+                                        egui::Color32::from_gray(100),
+                                    );
+                                    painter.circle_filled(center + egui::vec2(0.0, -r_head), r_head, cyan);
                                 }
-                                ToolShape::ThreadMill { diameter, .. } => {
+                                ToolShape::Dovetail { diameter, width, angle, .. } => {
+                                    // Slot width = axial cutter height; angle = side undercut.
+                                    let r_major = *diameter as f32 * 0.5 * scale;
+                                    let h       = (*width   as f32 * scale).min(fl * scale);
+                                    let undercut = h * (*angle as f32).to_radians().tan();
+                                    let r_neck = (r_major - undercut).max(0.5);
+                                    // Neck (above the flare)
+                                    painter.rect_filled(
+                                        egui::Rect::from_min_max(
+                                            center + egui::vec2(-r_neck, -fl * scale),
+                                            center + egui::vec2( r_neck, -h),
+                                        ),
+                                        0.0,
+                                        egui::Color32::from_gray(100),
+                                    );
+                                    // Flared cutter — wider at the bottom (classic dovetail T-slot profile).
+                                    painter.add(egui::Shape::convex_polygon(
+                                        vec![
+                                            center + egui::vec2(-r_neck, -h),
+                                            center + egui::vec2( r_neck, -h),
+                                            center + egui::vec2( r_major, 0.0),
+                                            center + egui::vec2(-r_major, 0.0),
+                                        ],
+                                        cyan,
+                                        egui::Stroke::NONE,
+                                    ));
+                                }
+                                ToolShape::ThreadMill { diameter, pitch, num_teeth, .. } => {
                                     let r = *diameter as f32 * 0.5 * scale;
-                                    painter.rect_filled(egui::Rect::from_min_max(center + egui::vec2(-r, -fl*scale), center + egui::vec2(r, 0.0)), 0.0, egui::Color32::from_rgb(0, 180, 255));
-                                    for i in 0..5 { // Simulated threads
-                                        let y = -i as f32 * 10.0;
-                                        painter.line_segment([center + egui::vec2(-r-2.0, y), center + egui::vec2(r+2.0, y-5.0)], egui::Stroke::new(1.0, egui::Color32::BLACK));
+                                    painter.rect_filled(
+                                        egui::Rect::from_min_max(
+                                            center + egui::vec2(-r, -fl * scale),
+                                            center + egui::vec2( r, 0.0),
+                                        ),
+                                        0.0,
+                                        cyan,
+                                    );
+                                    // Draw `num_teeth` triangular thread crests at `pitch` spacing.
+                                    let pitch_px = (*pitch as f32 * scale).max(2.0);
+                                    let crest    = pitch_px * 0.5;
+                                    for i in 0..(*num_teeth).max(1) {
+                                        let y = -(i as f32 + 0.5) * pitch_px;
+                                        if -y > fl * scale { break; }
+                                        painter.add(egui::Shape::convex_polygon(
+                                            vec![
+                                                center + egui::vec2(-r, y),
+                                                center + egui::vec2( r, y),
+                                                center + egui::vec2( r + crest, y - crest),
+                                                center + egui::vec2(-r - crest, y - crest),
+                                            ],
+                                            egui::Color32::from_gray(220),
+                                            egui::Stroke::NONE,
+                                        ));
                                     }
                                 }
-                                _ => {
-                                    painter.rect_filled(egui::Rect::from_min_max(center + egui::vec2(-d*0.5*scale, -fl*scale), center + egui::vec2(d*0.5*scale, 0.0)), 0.0, egui::Color32::from_rgb(0, 180, 255));
-                                }
                             }
-                            
-                            // Draw tip indicator
+
+                            // Tip indicator (red baseline at Z=0)
+                            let tip_half = max_radius * scale + 6.0;
                             painter.line_segment(
-                                [center + egui::vec2(-d*scale, 0.0), center + egui::vec2(d*scale, 0.0)],
-                                egui::Stroke::new(1.0, egui::Color32::RED)
+                                [
+                                    center + egui::vec2(-tip_half, 0.0),
+                                    center + egui::vec2( tip_half, 0.0),
+                                ],
+                                egui::Stroke::new(1.0, egui::Color32::RED),
+                            );
+
+                            // Scale label so the user knows the current zoom.
+                            painter.text(
+                                rect.left_top() + egui::vec2(8.0, 4.0),
+                                egui::Align2::LEFT_TOP,
+                                format!("⌀{:.2}mm  ⇣{:.1}mm  scale {:.1} px/mm", d, ol, scale),
+                                egui::FontId::proportional(11.0),
+                                egui::Color32::from_gray(160),
                             );
                         });
                     });
 
-                    if save_requested {
+                    if delete_requested {
+                        let removed = self.job.tools.remove(idx);
+                        // Best-effort: unlink the on-disk preset so the tool
+                        // doesn't resurrect itself on the next launch.
+                        let path = PathBuf::from("tools").join(format!("tool_{}.json", removed.id));
+                        match std::fs::remove_file(&path) {
+                            Ok(()) => self.log.push(format!(
+                                "Deleted tool T{} \"{}\" ({}).",
+                                removed.id, removed.name, path.display()
+                            )),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                self.log.push(format!("Deleted tool T{} \"{}\".", removed.id, removed.name));
+                            }
+                            Err(e) => self.log.push(format!(
+                                "Deleted tool T{} \"{}\" but couldn't remove {}: {e}",
+                                removed.id, removed.name, path.display()
+                            )),
+                        }
+                        self.selected_tool = None;
+                    } else if save_requested {
                         self.save_tool_to_dir(&self.job.tools[idx]);
                     }
                 }

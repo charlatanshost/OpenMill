@@ -90,8 +90,11 @@ impl ToolpathStrategy for ThreePlusTwo {
         );
         let to_world = to_local.inverse();
 
-        // Transform model AABB or just sample points and find local bounds.
-        let aabb = &model.aabb;
+        // Use the **stock** AABB (part AABB grown by margin) so the cuts
+        // actually clear the outer stock material instead of stopping at the
+        // part envelope.
+        let aabb = model.stock_aabb();
+        let aabb = &aabb;
         let corners = [
             Point3::new(aabb.mins.x, aabb.mins.y, aabb.mins.z),
             Point3::new(aabb.maxs.x, aabb.mins.y, aabb.mins.z),

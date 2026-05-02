@@ -22,11 +22,21 @@ pub struct Hole {
     pub depth: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DrillingParams {
     pub holes: Vec<Hole>,
     pub feed_rate: f64,
     pub dwell: f64,
+}
+
+impl Default for DrillingParams {
+    fn default() -> Self {
+        Self {
+            holes: Vec::new(),
+            feed_rate: 100.0,
+            dwell: 0.0,
+        }
+    }
 }
 
 impl ToolpathStrategy for Drilling5Axis {

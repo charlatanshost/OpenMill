@@ -22,9 +22,10 @@ pub use material::{Material, MaterialCategory, MaterialLibrary};
 pub use model::{StockShape, WorkpieceModel};
 pub use strategies::{
     AdaptiveClearing, AdaptiveClearingParams, ContourParallel, ContourParallelParams,
-    Drilling5Axis, DrillingParams, DrivePattern, GeodesicParallel, GeodesicParams,
+    Drilling5Axis, DrillingParams, DrivePattern, FourPlusOne, FourPlusOneParams,
+    GeodesicParallel, GeodesicParams,
     PencilTracing, PencilParams, SurfaceNormal5Axis, SurfaceNormal5AxisParams,
     Swarf5Axis, Swarf5AxisParams, ThreePlusTwo, ThreePlusTwoParams, ToolpathStrategy,
 };
-pub use tool::{Tool, ToolHolder, ToolShape};
+pub use tool::{starter_presets_for, Coolant, FeedSpeedPreset, Tool, ToolHolder, ToolShape};
 pub use toolpath::{MoveType, OperationType, Toolpath, ToolpathPoint};
