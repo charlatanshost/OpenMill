@@ -14,12 +14,15 @@ const STRATEGIES: &[&str] = &[
     "3+2 Indexed",
     "4+1 Indexed",
     "Adaptive Clearing",
+    "Pocket Clearing",
     "Contour Parallel",
     "Surface Normal 5-Axis",
     "Swarf 5-Axis",
     "Geodesic Parallel",
     "5-Axis Pencil Tracing",
     "5-Axis Drilling",
+    "Tapping",
+    "Thread Milling",
 ];
 
 // ── App state ───────────────────────────────────────────────────────────────
@@ -58,6 +61,21 @@ pub struct OpenMillApp {
     /// the user sees what material is left after each operation.
     view_mode: ViewMode,
 
+    /// Unit displayed in the stock-size editor (mm or decimal inch). Doesn't
+    /// affect the underlying job — the data model is always millimetres.
+    stock_units: StockUnits,
+
+    /// Recognised geometric features on the current model (holes, etc.).
+    /// Populated by `Detect Holes` in the Features section, used by ops like
+    /// 5-Axis Drilling. Cleared when a new model is imported.
+    features: Vec<openmill_core::Feature>,
+
+    /// When `true`, a left-click in the viewport raycasts the mesh and
+    /// flood-fills coplanar neighbours into a `Feature` (auto-classified by
+    /// normal direction). Drag still orbits the camera so the user can keep
+    /// the same UX.
+    pick_face_mode: bool,
+
     // Tab system
     active_tab: AppTab,
 
@@ -80,6 +98,138 @@ pub enum ViewMode {
     /// Hide the part mesh, show the voxel stock as it gets carved — used to
     /// verify what material is left after each operation.
     Simulation,
+}
+
+/// Where to send a feature when the user clicks "→ <Strategy>" in the
+/// Features panel. Each variant maps to a strategy name and knows how to
+/// append to (or replace) the op's feature-driven list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeatureAssignTarget {
+    Drilling,
+    Tapping,
+    ThreadMill,
+    PocketClearing,
+}
+
+impl FeatureAssignTarget {
+    fn expected_strategy(self) -> &'static str {
+        match self {
+            FeatureAssignTarget::Drilling       => "5-Axis Drilling",
+            FeatureAssignTarget::Tapping        => "Tapping",
+            FeatureAssignTarget::ThreadMill     => "Thread Milling",
+            FeatureAssignTarget::PocketClearing => "Pocket Clearing",
+        }
+    }
+    /// Append the feature to the op's list. Returns the new list length, or
+    /// `None` if the feature kind is incompatible.
+    fn append_one(self, op: &mut openmill_core::Operation, f: &openmill_core::Feature) -> Option<usize> {
+        match self {
+            FeatureAssignTarget::Drilling => {
+                let hole = openmill_core::feature_to_hole(f)?;
+                let mut p: openmill_core::DrillingParams =
+                    serde_json::from_value(op.params.clone()).unwrap_or_default();
+                p.holes.push(hole);
+                let n = p.holes.len();
+                op.params = serde_json::to_value(&p).unwrap();
+                Some(n)
+            }
+            FeatureAssignTarget::Tapping => {
+                let hole = openmill_core::feature_to_hole(f)?;
+                let mut p: openmill_core::TappingParams =
+                    serde_json::from_value(op.params.clone()).unwrap_or_default();
+                p.holes.push(hole);
+                let n = p.holes.len();
+                op.params = serde_json::to_value(&p).unwrap();
+                Some(n)
+            }
+            FeatureAssignTarget::ThreadMill => {
+                let hole = openmill_core::feature_to_hole(f)?;
+                let mut p: openmill_core::ThreadMillingParams =
+                    serde_json::from_value(op.params.clone()).unwrap_or_default();
+                p.holes.push(hole);
+                let n = p.holes.len();
+                op.params = serde_json::to_value(&p).unwrap();
+                Some(n)
+            }
+            FeatureAssignTarget::PocketClearing => {
+                let pocket = openmill_core::PocketRef::from_feature(f)?;
+                let mut p: openmill_core::PocketClearingParams =
+                    serde_json::from_value(op.params.clone()).unwrap_or_default();
+                p.pockets.push(pocket);
+                let n = p.pockets.len();
+                op.params = serde_json::to_value(&p).unwrap();
+                Some(n)
+            }
+        }
+    }
+    /// Replace the op's list with every compatible feature. Returns the new length.
+    fn replace_all(self, op: &mut openmill_core::Operation, features: &[openmill_core::Feature]) -> usize {
+        match self {
+            FeatureAssignTarget::Drilling => {
+                let mut p: openmill_core::DrillingParams =
+                    serde_json::from_value(op.params.clone()).unwrap_or_default();
+                p.holes = features.iter().filter_map(openmill_core::feature_to_hole).collect();
+                let n = p.holes.len();
+                op.params = serde_json::to_value(&p).unwrap();
+                n
+            }
+            FeatureAssignTarget::Tapping => {
+                let mut p: openmill_core::TappingParams =
+                    serde_json::from_value(op.params.clone()).unwrap_or_default();
+                p.holes = features.iter().filter_map(openmill_core::feature_to_hole).collect();
+                let n = p.holes.len();
+                op.params = serde_json::to_value(&p).unwrap();
+                n
+            }
+            FeatureAssignTarget::ThreadMill => {
+                let mut p: openmill_core::ThreadMillingParams =
+                    serde_json::from_value(op.params.clone()).unwrap_or_default();
+                p.holes = features.iter().filter_map(openmill_core::feature_to_hole).collect();
+                let n = p.holes.len();
+                op.params = serde_json::to_value(&p).unwrap();
+                n
+            }
+            FeatureAssignTarget::PocketClearing => {
+                let mut p: openmill_core::PocketClearingParams =
+                    serde_json::from_value(op.params.clone()).unwrap_or_default();
+                p.pockets = features.iter().filter_map(openmill_core::PocketRef::from_feature).collect();
+                let n = p.pockets.len();
+                op.params = serde_json::to_value(&p).unwrap();
+                n
+            }
+        }
+    }
+}
+
+/// Unit displayed in the stock-size editor. The on-disk data model always
+/// stores millimetres; this only affects what the user sees and edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StockUnits {
+    Mm,
+    /// Decimal inches (e.g. 1.5 in, not 1-1/2).
+    Inch,
+}
+
+impl StockUnits {
+    /// One unit in millimetres.
+    pub fn to_mm(self) -> f64 {
+        match self {
+            StockUnits::Mm   => 1.0,
+            StockUnits::Inch => 25.4,
+        }
+    }
+    pub fn suffix(self) -> &'static str {
+        match self {
+            StockUnits::Mm   => " mm",
+            StockUnits::Inch => " in",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            StockUnits::Mm   => "mm",
+            StockUnits::Inch => "in",
+        }
+    }
 }
 
 
@@ -107,6 +257,9 @@ impl OpenMillApp {
             sim_op_idx: None,
             sim_collisions: Vec::new(),
             view_mode: ViewMode::Plan,
+            stock_units: StockUnits::Mm,
+            features: Vec::new(),
+            pick_face_mode: false,
             active_tab: AppTab::Manufacturing,
             machine_library: MachineLibrary::load("machines").unwrap_or_default(),
         };
@@ -182,10 +335,19 @@ impl eframe::App for OpenMillApp {
                             ray_dir,
                         );
                         
-                        // Check if the tool tip path intersects the mesh (simple tip collision for now)
+                        // Check if the tool tip path intersects the mesh (simple tip collision)
                         if let Some(toi) = model.mesh.cast_local_ray(&ray, dist, true) {
                             let hit_pt = ray.point_at(toi);
                             self.sim_collisions.push(hit_pt);
+                            vp.upload_collisions(&rs.device, &self.sim_collisions);
+                        }
+
+                        // Holder collision: tool's holder envelope vs mesh
+                        // vertices at the END pose. Catches the most common
+                        // 5-axis crash mode where the spindle nose hits the
+                        // part long before the cutter does.
+                        if let Some(hit) = openmill_core::holder_collision(&tool, &pose2, &model.mesh) {
+                            self.sim_collisions.push(hit);
                             vp.upload_collisions(&rs.device, &self.sim_collisions);
                         }
                     }
@@ -295,6 +457,17 @@ impl OpenMillApp {
                         self.toolpaths.clear();
                         self.selected_tool = None;
                         self.selected_op = None;
+                        self.features.clear();
+                        self.sim_op_idx = None;
+                        self.sim_progress = 0.0;
+                        self.sim_prev_progress = 0.0;
+                        self.sim_collisions.clear();
+                        self.sim_gcode.clear();
+                        if let (Some(rs), Some(vp)) = (&self.render_state, &mut self.viewport) {
+                            let _ = rs;
+                            vp.clear_pick();
+                            vp.upload_collisions(&rs.device, &[]);
+                        }
                         self.log.push("New job created.".into());
                         ui.close_menu();
                     }
@@ -313,6 +486,16 @@ impl OpenMillApp {
 
                     if ui.button("Import Model (STL/3MF)...").clicked() {
                         self.action_import_model();
+                        ui.close_menu();
+                    }
+                });
+
+                // ── Verify ────────────────────────────────────────────
+                ui.menu_button("Verify", |ui| {
+                    if ui.button("✓ Verify all toolpaths").on_hover_text(
+                        "Run pre-export checks: travel limits, rotary range, undefined feeds, gouges, holder collisions."
+                    ).clicked() {
+                        self.action_verify();
                         ui.close_menu();
                     }
                 });
@@ -385,6 +568,8 @@ impl OpenMillApp {
                     ui.separator();
                     self.section_tools(ui);
                     ui.separator();
+                    self.section_features(ui);
+                    ui.separator();
                     self.section_operations(ui);
                     ui.separator();
                     self.section_settings(ui);
@@ -422,9 +607,31 @@ impl OpenMillApp {
             ui.separator();
             ui.label("Stock:");
             let mut stock_changed = false;
+
+            // Unit toggle (mm / decimal inch). Affects display only — the
+            // underlying job is always stored in millimetres.
+            ui.horizontal(|ui| {
+                ui.label("Units:");
+                ui.selectable_value(&mut self.stock_units, StockUnits::Mm,   "mm");
+                ui.selectable_value(&mut self.stock_units, StockUnits::Inch, "inch (decimal)");
+            });
+            let units = self.stock_units;
+            let to_mm = units.to_mm();
+            // Display speed in current units — slower drag in inches because
+            // 1 inch = 25.4 mm, so a 0.1-step in inches ≈ 2.5 mm.
+            let drag_speed = if units == StockUnits::Mm { 0.5 } else { 0.025 };
+
+            // Snapshot the part dimensions in mm before borrowing self.job.stock,
+            // so we can convert between (margin) and (absolute size) without a
+            // borrow-checker conflict against self.model.
+            let part_dims_mm: Option<[f64; 3]> = self.model.as_ref().map(|m| {
+                let s = m.aabb.maxs - m.aabb.mins;
+                [s.x as f64, s.y as f64, s.z as f64]
+            });
+
             let mut current_type = match self.job.stock {
                 openmill_core::job::StockDef::BoundingBox { .. } => 0,
-                openmill_core::job::StockDef::Cylinder { .. } => 1,
+                openmill_core::job::StockDef::Cylinder    { .. } => 1,
                 _ => 0,
             };
 
@@ -452,21 +659,82 @@ impl OpenMillApp {
 
             match &mut self.job.stock {
                 openmill_core::job::StockDef::BoundingBox { margin } => {
-                    ui.horizontal(|ui| {
-                        ui.label("Margin X:");
-                        stock_changed |= ui.add(egui::DragValue::new(&mut margin[0]).speed(0.1)).changed();
-                        ui.label("Y:");
-                        stock_changed |= ui.add(egui::DragValue::new(&mut margin[1]).speed(0.1)).changed();
-                        ui.label("Z:");
-                        stock_changed |= ui.add(egui::DragValue::new(&mut margin[2]).speed(0.1)).changed();
-                    });
+                    if let Some(part_mm) = part_dims_mm {
+                        // Edit absolute stock dimensions (W × D × H). The
+                        // symmetric per-axis margin is derived from
+                        //   margin[i] = (stock_size[i] - part_size[i]) / 2.
+                        let mut size_disp = [
+                            (part_mm[0] + 2.0 * margin[0]) / to_mm,
+                            (part_mm[1] + 2.0 * margin[1]) / to_mm,
+                            (part_mm[2] + 2.0 * margin[2]) / to_mm,
+                        ];
+                        ui.horizontal(|ui| {
+                            ui.label("Size W:");
+                            if ui.add(egui::DragValue::new(&mut size_disp[0]).speed(drag_speed).suffix(units.suffix())).changed() {
+                                margin[0] = ((size_disp[0] * to_mm) - part_mm[0]) * 0.5;
+                                stock_changed = true;
+                            }
+                            ui.label("D:");
+                            if ui.add(egui::DragValue::new(&mut size_disp[1]).speed(drag_speed).suffix(units.suffix())).changed() {
+                                margin[1] = ((size_disp[1] * to_mm) - part_mm[1]) * 0.5;
+                                stock_changed = true;
+                            }
+                            ui.label("H:");
+                            if ui.add(egui::DragValue::new(&mut size_disp[2]).speed(drag_speed).suffix(units.suffix())).changed() {
+                                margin[2] = ((size_disp[2] * to_mm) - part_mm[2]) * 0.5;
+                                stock_changed = true;
+                            }
+                        });
+                        // Show the derived per-side offset as a hint.
+                        ui.weak(format!(
+                            "Offset per side: {:.3} × {:.3} × {:.3} {}",
+                            margin[0] / to_mm,
+                            margin[1] / to_mm,
+                            margin[2] / to_mm,
+                            units.label(),
+                        ));
+                    } else {
+                        // No model loaded — fall back to per-side margin
+                        // editing in the current unit.
+                        let mut margin_disp = [
+                            margin[0] / to_mm,
+                            margin[1] / to_mm,
+                            margin[2] / to_mm,
+                        ];
+                        ui.horizontal(|ui| {
+                            ui.label("Margin X:");
+                            if ui.add(egui::DragValue::new(&mut margin_disp[0]).speed(drag_speed).suffix(units.suffix())).changed() {
+                                margin[0] = margin_disp[0] * to_mm;
+                                stock_changed = true;
+                            }
+                            ui.label("Y:");
+                            if ui.add(egui::DragValue::new(&mut margin_disp[1]).speed(drag_speed).suffix(units.suffix())).changed() {
+                                margin[1] = margin_disp[1] * to_mm;
+                                stock_changed = true;
+                            }
+                            ui.label("Z:");
+                            if ui.add(egui::DragValue::new(&mut margin_disp[2]).speed(drag_speed).suffix(units.suffix())).changed() {
+                                margin[2] = margin_disp[2] * to_mm;
+                                stock_changed = true;
+                            }
+                        });
+                        ui.weak("Load a model to set absolute stock dimensions.");
+                    }
                 }
                 openmill_core::job::StockDef::Cylinder { diameter, height } => {
+                    let mut diameter_disp = *diameter / to_mm;
+                    let mut height_disp   = *height   / to_mm;
                     ui.horizontal(|ui| {
                         ui.label("Diameter:");
-                        stock_changed |= ui.add(egui::DragValue::new(diameter).speed(0.1).suffix(" mm")).changed();
+                        if ui.add(egui::DragValue::new(&mut diameter_disp).speed(drag_speed).suffix(units.suffix())).changed() {
+                            *diameter = diameter_disp * to_mm;
+                            stock_changed = true;
+                        }
                         ui.label("Height:");
-                        stock_changed |= ui.add(egui::DragValue::new(height).speed(0.1).suffix(" mm")).changed();
+                        if ui.add(egui::DragValue::new(&mut height_disp).speed(drag_speed).suffix(units.suffix())).changed() {
+                            *height = height_disp * to_mm;
+                            stock_changed = true;
+                        }
                     });
                 }
                 _ => {}
@@ -477,6 +745,71 @@ impl OpenMillApp {
                     model.stock = self.job.stock.to_shape();
                     if let (Some(rs), Some(vp)) = (&self.render_state, &mut self.viewport) {
                         vp.upload_stock(&rs.device, &rs.queue, &model.aabb, &model.stock);
+                    }
+                }
+            }
+
+            // ── Model position in the work area ─────────────────────────
+            // Translates the imported mesh by `position` so the user can
+            // place it anywhere in the workpiece coordinate system. Stock
+            // follows automatically because it's derived from the part AABB.
+            if let Some(model) = self.model.as_ref() {
+                ui.separator();
+                ui.label("Model position (workpiece origin offset):");
+                let mut pos_disp = [
+                    model.position.x / to_mm,
+                    model.position.y / to_mm,
+                    model.position.z / to_mm,
+                ];
+                let mut pos_changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("X:");
+                    pos_changed |= ui.add(egui::DragValue::new(&mut pos_disp[0]).speed(drag_speed).suffix(units.suffix())).changed();
+                    ui.label("Y:");
+                    pos_changed |= ui.add(egui::DragValue::new(&mut pos_disp[1]).speed(drag_speed).suffix(units.suffix())).changed();
+                    ui.label("Z:");
+                    pos_changed |= ui.add(egui::DragValue::new(&mut pos_disp[2]).speed(drag_speed).suffix(units.suffix())).changed();
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("⟲ Reset").on_hover_text(
+                        "Move the model back to the imported origin (0, 0, 0)."
+                    ).clicked() {
+                        pos_disp = [0.0, 0.0, 0.0];
+                        pos_changed = true;
+                    }
+                    if ui.button("⌖ Centre on origin").on_hover_text(
+                        "Translate the model so its AABB centroid sits at the workpiece origin."
+                    ).clicked() {
+                        // Subtract current centroid from current position so the new
+                        // centroid lands at (0, 0, 0).
+                        let s = model.aabb.maxs - model.aabb.mins;
+                        let cx = (model.aabb.mins.x as f64 + s.x as f64 * 0.5) - model.position.x;
+                        let cy = (model.aabb.mins.y as f64 + s.y as f64 * 0.5) - model.position.y;
+                        let cz = (model.aabb.mins.z as f64 + s.z as f64 * 0.5) - model.position.z;
+                        pos_disp = [-cx / to_mm, -cy / to_mm, -cz / to_mm];
+                        pos_changed = true;
+                    }
+                });
+                if pos_changed {
+                    let new_pos = nalgebra::Vector3::new(
+                        pos_disp[0] * to_mm,
+                        pos_disp[1] * to_mm,
+                        pos_disp[2] * to_mm,
+                    );
+                    // Mirror onto the persistent job so save/load round-trips
+                    // preserve the position.
+                    self.job.model_position = [new_pos.x, new_pos.y, new_pos.z];
+                    if let Some(m) = self.model.as_mut() {
+                        m.set_position(new_pos);
+                        if let (Some(rs), Some(vp)) = (&self.render_state, &mut self.viewport) {
+                            vp.upload_mesh(&rs.device, &m.mesh);
+                            vp.upload_stock(&rs.device, &rs.queue, &m.aabb, &m.stock);
+                        }
+                        // Voxel volume bounds also depend on model AABB;
+                        // force a rebuild on the next sim-mode entry.
+                        self.sim_op_idx = None;
+                        self.sim_progress = 0.0;
+                        self.sim_prev_progress = 0.0;
                     }
                 }
             }
@@ -502,6 +835,268 @@ impl OpenMillApp {
         });
     }
 
+    // ── Features ─────────────────────────────────────────────────────────
+    //
+    // A "feature" is a recognised piece of part geometry (a hole, a pocket,
+    // a flat face) that the user can assign to an operation. Today the
+    // detector finds vertical-axis cylindrical holes; pocket and thread-mill
+    // detection are scoped for future work.
+
+    fn section_features(&mut self, ui: &mut egui::Ui) {
+        ui.collapsing(format!("Features ({})", self.features.len()), |ui| {
+            // Manual face-pick toggle. When on, a left-click in the viewport
+            // (without dragging) raycasts the mesh and adds the picked face
+            // cluster as a feature.
+            ui.horizontal(|ui| {
+                let was_on = self.pick_face_mode;
+                if ui.toggle_value(&mut self.pick_face_mode, "🎯 Pick Face Mode")
+                    .on_hover_text(
+                        "When on: click any face in the viewport to add it as a feature.\n\
+                         Drag still orbits the camera. Click again to add another."
+                    ).changed()
+                {
+                    if !self.pick_face_mode && was_on {
+                        // Turning it off — clear the highlight.
+                        if let (Some(rs), Some(vp)) = (&self.render_state, &mut self.viewport) {
+                            let _ = rs;
+                            vp.clear_pick();
+                        }
+                    }
+                }
+                if self.pick_face_mode {
+                    ui.weak("(click a face to add)");
+                }
+            });
+
+            // Detection actions
+            ui.horizontal(|ui| {
+                let model_loaded = self.model.is_some();
+                ui.add_enabled_ui(model_loaded, |ui| {
+                    if ui.button("🔍 Holes").on_hover_text(
+                        "Scan the imported mesh for vertical cylindrical holes."
+                    ).clicked() {
+                        if let Some(model) = &self.model {
+                            let mut found = openmill_core::detect_holes(&model.mesh);
+                            let mut next_id = self.features.iter().map(|f| f.id).max().unwrap_or(0) + 1;
+                            for f in &mut found { f.id = next_id; next_id += 1; }
+                            let added = found.len();
+                            self.features.extend(found);
+                            self.log.push(format!(
+                                "Hole detection: {} new feature(s) (total {}).",
+                                added, self.features.len(),
+                            ));
+                        }
+                    }
+                    if ui.button("🔍 Pockets").on_hover_text(
+                        "Scan the imported mesh for open-top pockets (horizontal floor faces with clearance above)."
+                    ).clicked() {
+                        if let Some(model) = &self.model {
+                            let mut found = openmill_core::detect_pockets(&model.mesh);
+                            let mut next_id = self.features.iter().map(|f| f.id).max().unwrap_or(0) + 1;
+                            for f in &mut found { f.id = next_id; next_id += 1; }
+                            let added = found.len();
+                            self.features.extend(found);
+                            self.log.push(format!(
+                                "Pocket detection: {} new feature(s) (total {}).",
+                                added, self.features.len(),
+                            ));
+                        }
+                    }
+                });
+                if !self.features.is_empty() && ui.button("🗑 Clear All").clicked() {
+                    let n = self.features.len();
+                    self.features.clear();
+                    self.log.push(format!("Cleared {n} feature(s)."));
+                }
+                if !model_loaded {
+                    ui.weak("(import a model first)");
+                }
+            });
+
+            // Feature list with per-row delete + assign actions.
+            let mut to_delete: Option<usize> = None;
+            let mut assign_action: Option<(usize, FeatureAssignTarget)> = None;
+            for (idx, f) in self.features.iter().enumerate() {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(format!("[{}] #{}", f.type_label(), f.id));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("🗑").on_hover_text("Remove this feature").clicked() {
+                                to_delete = Some(idx);
+                            }
+                        });
+                    });
+                    ui.label(&f.label);
+                    ui.horizontal_wrapped(|ui| {
+                        match f.kind {
+                            openmill_core::FeatureKind::Hole { .. } => {
+                                if ui.small_button("→ Drilling").on_hover_text(
+                                    "Append this hole to the selected 5-Axis Drilling op."
+                                ).clicked() {
+                                    assign_action = Some((idx, FeatureAssignTarget::Drilling));
+                                }
+                                if ui.small_button("→ Tapping").on_hover_text(
+                                    "Append this hole to the selected Tapping op."
+                                ).clicked() {
+                                    assign_action = Some((idx, FeatureAssignTarget::Tapping));
+                                }
+                                if ui.small_button("→ Thread Mill").on_hover_text(
+                                    "Append this hole to the selected Thread Milling op."
+                                ).clicked() {
+                                    assign_action = Some((idx, FeatureAssignTarget::ThreadMill));
+                                }
+                            }
+                            openmill_core::FeatureKind::Pocket { .. } => {
+                                if ui.small_button("→ Pocket Clearing").on_hover_text(
+                                    "Append this pocket to the selected Pocket Clearing op."
+                                ).clicked() {
+                                    assign_action = Some((idx, FeatureAssignTarget::PocketClearing));
+                                }
+                            }
+                            openmill_core::FeatureKind::FlatFace { .. } => {}
+                        }
+                    });
+                });
+            }
+            if let Some(i) = to_delete {
+                self.features.remove(i);
+            }
+            if let Some((i, target)) = assign_action {
+                self.assign_feature_to_op(i, target);
+            }
+
+            // Bulk-assign shortcuts.
+            if !self.features.is_empty() {
+                ui.add_space(4.0);
+                let n_holes = self.features.iter()
+                    .filter(|f| matches!(f.kind, openmill_core::FeatureKind::Hole { .. }))
+                    .count();
+                let n_pockets = self.features.iter()
+                    .filter(|f| matches!(f.kind, openmill_core::FeatureKind::Pocket { .. }))
+                    .count();
+                if n_holes > 0 {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Bulk assign all {n_holes} holes to:"));
+                        if ui.small_button("Drilling").clicked()    { self.assign_all_to_op(FeatureAssignTarget::Drilling); }
+                        if ui.small_button("Tapping").clicked()     { self.assign_all_to_op(FeatureAssignTarget::Tapping); }
+                        if ui.small_button("Thread Mill").clicked() { self.assign_all_to_op(FeatureAssignTarget::ThreadMill); }
+                    });
+                }
+                if n_pockets > 0 {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Bulk assign all {n_pockets} pockets to:"));
+                        if ui.small_button("Pocket Clearing").clicked() {
+                            self.assign_all_to_op(FeatureAssignTarget::PocketClearing);
+                        }
+                    });
+                }
+            }
+        });
+    }
+
+    /// Append a single feature to the selected operation, if its strategy
+    /// matches the requested target.
+    fn assign_feature_to_op(&mut self, feature_idx: usize, target: FeatureAssignTarget) {
+        let Some(op_idx) = self.selected_op else {
+            self.log.push(format!("Select a {} op first.", target.expected_strategy()));
+            return;
+        };
+        let Some(feature) = self.features.get(feature_idx).cloned() else { return };
+        let op = &mut self.job.operations[op_idx];
+        if op.strategy != target.expected_strategy() {
+            self.log.push(format!(
+                "Selected op \"{}\" is a {} — switch to a {} op.",
+                op.name, op.strategy, target.expected_strategy()
+            ));
+            return;
+        }
+        let added = target.append_one(op, &feature);
+        if let Some(n) = added {
+            self.log.push(format!(
+                "Added feature #{} to op \"{}\" ({n} item(s) total).",
+                feature.id, op.name
+            ));
+        } else {
+            self.log.push(format!(
+                "Feature #{} kind doesn't match {} — skipped.",
+                feature.id, target.expected_strategy()
+            ));
+        }
+    }
+
+    /// Cast a ray from the click position into the loaded mesh, flood-fill
+    /// coplanar neighbours, and add the result as a new auto-classified
+    /// `Feature`. Highlights the picked face cluster in the viewport.
+    fn handle_face_pick(&mut self, click_pos: egui::Pos2, rect: egui::Rect) {
+        let Some(model) = self.model.as_ref() else {
+            self.log.push("Pick face: no model loaded.".into());
+            return;
+        };
+
+        // Click position relative to the viewport's top-left.
+        let px = click_pos.x - rect.left();
+        let py = click_pos.y - rect.top();
+        let (origin, dir) = self.camera.ray_from_screen(px, py, rect.width(), rect.height());
+
+        // Tolerance in degrees: triangles within this dihedral angle of the
+        // seed are flooded into the cluster. ~5° handles "really flat" face
+        // groups well; loosen for curved surfaces, tighten for tessellated planes.
+        let angle_tol_deg = 5.0;
+        let pick = match openmill_core::pick_face(&model.mesh, origin, dir, angle_tol_deg) {
+            Some(p) => p,
+            None => {
+                self.log.push("Pick face: ray missed the mesh.".into());
+                return;
+            }
+        };
+
+        // Auto-classify and add to the features list.
+        let next_id = self.features.iter().map(|f| f.id).max().unwrap_or(0) + 1;
+        let feature = pick.to_feature(&model.mesh, next_id);
+        self.log.push(format!(
+            "Picked {}: {} ({} triangles, {:.1}mm² total).",
+            feature.type_label(), feature.label, pick.cluster_tris.len(), pick.area,
+        ));
+        self.features.push(feature);
+
+        // Upload the cluster as a highlight overlay.
+        let tris: Vec<[nalgebra::Point3<f32>; 3]> = pick.cluster_tris.iter().map(|&t| {
+            let tri = model.mesh.indices()[t];
+            [
+                model.mesh.vertices()[tri[0] as usize],
+                model.mesh.vertices()[tri[1] as usize],
+                model.mesh.vertices()[tri[2] as usize],
+            ]
+        }).collect();
+        if let (Some(rs), Some(vp)) = (&self.render_state, &mut self.viewport) {
+            vp.upload_pick_triangles(&rs.device, &tris);
+        }
+    }
+
+    /// Replace the selected op's feature-driven list with **all** matching
+    /// features in the library.
+    fn assign_all_to_op(&mut self, target: FeatureAssignTarget) {
+        let Some(op_idx) = self.selected_op else {
+            self.log.push(format!("Select a {} op first.", target.expected_strategy()));
+            return;
+        };
+        // Snapshot the matching features before borrowing the op mutably.
+        let features_snapshot: Vec<openmill_core::Feature> = self.features.clone();
+        let op = &mut self.job.operations[op_idx];
+        if op.strategy != target.expected_strategy() {
+            self.log.push(format!(
+                "Selected op \"{}\" is a {} — switch to a {} op.",
+                op.name, op.strategy, target.expected_strategy()
+            ));
+            return;
+        }
+        let n = target.replace_all(op, &features_snapshot);
+        self.log.push(format!(
+            "Assigned {n} feature(s) to op \"{}\" (replaced previous list).",
+            op.name,
+        ));
+    }
+
     // ── Operations ───────────────────────────────────────────────────────
 
     fn section_operations(&mut self, ui: &mut egui::Ui) {
@@ -509,21 +1104,82 @@ impl OpenMillApp {
             let mut remove_idx = None;
             let mut generate_requested = false;
 
+            // Estimated runtime per op + grand total. Conservative rapid speed
+            // until we add a per-machine override; matches typical hobby CNC
+            // values (5000 mm/min ≈ 197 ipm).
+            const RAPID_MM_MIN: f64 = 5000.0;
+            let durations: Vec<f64> = self.toolpaths.iter()
+                .map(|paths| paths.iter().map(|tp| tp.duration_minutes(RAPID_MM_MIN)).sum::<f64>())
+                .collect();
+            let job_total: f64 = durations.iter().sum();
+            if job_total > 0.0 {
+                ui.weak(format!("Total estimated runtime: {}", fmt_minutes(job_total)));
+                ui.separator();
+            }
+
             let mut selection_changed = false;
+            // Defer reorder until after the loop so we don't mutate `self`
+            // while iterating its operations Vec.
+            let mut move_up: Option<usize> = None;
+            let mut move_down: Option<usize> = None;
+            let n_ops = self.job.operations.len();
             for (i, op) in self.job.operations.iter().enumerate() {
                 let selected = self.selected_op == Some(i);
+                let est = durations.get(i).copied().unwrap_or(0.0);
                 let status = if i < self.toolpaths.len() && !self.toolpaths[i].is_empty() {
-                    " [generated]"
+                    if est > 0.0 {
+                        format!(" [{}]", fmt_minutes(est))
+                    } else {
+                        " [generated]".to_string()
+                    }
                 } else {
-                    ""
+                    String::new()
                 };
                 let enabled = if op.enabled { "" } else { " (disabled)" };
                 let label = format!("{}{}{}", op.name, enabled, status);
-                if ui.selectable_label(selected, &label).clicked() {
-                    self.selected_op = if selected { None } else { Some(i) };
-                    selection_changed = true;
-                }
+                ui.horizontal(|ui| {
+                    // Reorder controls — ops execute in list order at export
+                    // time, so users need to be able to shuffle them.
+                    ui.add_enabled_ui(i > 0, |ui| {
+                        if ui.small_button("⬆").on_hover_text("Move up").clicked() {
+                            move_up = Some(i);
+                        }
+                    });
+                    ui.add_enabled_ui(i + 1 < n_ops, |ui| {
+                        if ui.small_button("⬇").on_hover_text("Move down").clicked() {
+                            move_down = Some(i);
+                        }
+                    });
+                    if ui.selectable_label(selected, &label).clicked() {
+                        self.selected_op = if selected { None } else { Some(i) };
+                        selection_changed = true;
+                    }
+                });
             }
+
+            // Apply at most one reorder per frame. Swapping also moves the
+            // matching toolpaths so the parallel array stays in sync, and
+            // updates `selected_op` so the user keeps focus on the op they
+            // just shuffled.
+            let mut apply_swap = |a: usize, b: usize, this: &mut Self| {
+                this.job.operations.swap(a, b);
+                if a < this.toolpaths.len() && b < this.toolpaths.len() {
+                    this.toolpaths.swap(a, b);
+                }
+                this.selected_op = match this.selected_op {
+                    Some(x) if x == a => Some(b),
+                    Some(x) if x == b => Some(a),
+                    other => other,
+                };
+                // Op order affects stock progression — force a rebuild on the
+                // next sim entry.
+                this.sim_op_idx = None;
+                this.sim_progress = 0.0;
+                this.sim_prev_progress = 0.0;
+                selection_changed = true;
+            };
+            if let Some(i) = move_up   { apply_swap(i, i - 1, self); }
+            if let Some(i) = move_down { apply_swap(i, i + 1, self); }
 
             if selection_changed {
                 self.update_sim_gcode();
@@ -639,6 +1295,17 @@ impl OpenMillApp {
                         });
 
                         ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("Stock to leave:");
+                            ui.add(egui::DragValue::new(&mut op.stock_to_leave).speed(0.05).range(0.0..=10.0).suffix(" mm"))
+                                .on_hover_text(
+                                    "Skin of material left on the part by this op so a finishing op can take it off.\n\
+                                     Roughing typical: 0.2–0.5 mm.   Finishing: 0.0.\n\
+                                     Auto-injected into the strategy params at generate time."
+                                );
+                        });
+
+                        ui.separator();
                         ui.label("Custom op G-code (run after spindle/coolant on):");
                         ui.add(
                             egui::TextEdit::multiline(&mut op.gcode_command)
@@ -701,6 +1368,7 @@ impl OpenMillApp {
                     plunge_rate: plunge,
                     coolant,
                     gcode_command: String::new(),
+                    stock_to_leave: 0.0,
                     enabled: true,
                 };
                 self.job.operations.push(op);
@@ -786,6 +1454,16 @@ impl OpenMillApp {
                 0.0
             };
             self.camera.handle_input(&response, scroll);
+
+            // ── Face picking ───────────────────────────────────────────────
+            // A discrete left-click (no drag) while pick-face mode is active
+            // raycasts the mesh, floods coplanar neighbours into a feature,
+            // and highlights the cluster.
+            if self.pick_face_mode && response.clicked() {
+                if let Some(click_pos) = response.interact_pointer_pos() {
+                    self.handle_face_pick(click_pos, rect);
+                }
+            }
 
             // Render and display.
             if let (Some(rs), Some(vp)) = (&self.render_state, &mut self.viewport) {
@@ -1021,28 +1699,64 @@ impl OpenMillApp {
             .set_title("Open Job")
             .pick_file();
 
-        if let Some(path) = file {
-            match std::fs::read_to_string(&path) {
-                Ok(json) => match serde_json::from_str::<Job>(&json) {
-                    Ok(job) => {
-                        // Try to load the model if path is set.
-                        if let Some(ref mp) = job.model_path {
-                            let model_path = path.parent()
-                                .map(|p| p.join(mp))
-                                .unwrap_or_else(|| PathBuf::from(mp));
-                            self.try_load_model(&model_path);
-                        }
-                        self.toolpaths = vec![Vec::new(); job.operations.len()];
-                        self.job = job;
-                        self.selected_tool = None;
-                        self.selected_op = None;
-                        self.log.push(format!("Opened job from {}", path.display()));
+        let Some(path) = file else { return };
+        let json = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => { self.log.push(format!("Failed to read file: {e}")); return; }
+        };
+        let job = match serde_json::from_str::<Job>(&json) {
+            Ok(j) => j,
+            Err(e) => { self.log.push(format!("Failed to parse job: {e}")); return; }
+        };
+
+        // Reset live state. This needs to happen BEFORE try_load_model so
+        // the new model's positioning + stock derive from the loaded job,
+        // not whatever was on screen.
+        let model_path_relative = job.model_path.clone();
+        let model_position = nalgebra::Vector3::new(
+            job.model_position[0], job.model_position[1], job.model_position[2],
+        );
+        self.toolpaths = vec![Vec::new(); job.operations.len()];
+        self.selected_tool = None;
+        self.selected_op   = None;
+        self.features.clear();
+        self.sim_op_idx = None;
+        self.sim_progress = 0.0;
+        self.sim_prev_progress = 0.0;
+        self.sim_collisions.clear();
+        self.sim_gcode.clear();
+        self.model = None;
+        if let (Some(rs), Some(vp)) = (&self.render_state, &mut self.viewport) {
+            let _ = rs;
+            vp.clear_pick();
+            vp.upload_collisions(&rs.device, &[]);
+        }
+        self.job = job;
+
+        // Try to load the model — relative paths resolve against the job file's
+        // directory.
+        if let Some(mp) = model_path_relative {
+            let model_path = path.parent()
+                .map(|p| p.join(&mp))
+                .unwrap_or_else(|| PathBuf::from(&mp));
+            self.try_load_model(&model_path);
+            // Re-apply the saved position now that the model is loaded.
+            if model_position.norm_squared() > 1e-12 {
+                if let Some(m) = self.model.as_mut() {
+                    m.set_position(model_position);
+                    if let (Some(rs), Some(vp)) = (&self.render_state, &mut self.viewport) {
+                        vp.upload_mesh(&rs.device, &m.mesh);
+                        vp.upload_stock(&rs.device, &rs.queue, &m.aabb, &m.stock);
                     }
-                    Err(e) => self.log.push(format!("Failed to parse job: {e}")),
-                },
-                Err(e) => self.log.push(format!("Failed to read file: {e}")),
+                }
             }
         }
+        self.log.push(format!(
+            "Opened job from {} — {} ops, {} tools.",
+            path.display(),
+            self.job.operations.len(),
+            self.job.tools.len(),
+        ));
     }
 
     fn action_save_job(&mut self) {
@@ -1118,15 +1832,70 @@ impl OpenMillApp {
                 }
 
                 self.model = Some(model);
+                // New model invalidates any features detected on the previous one,
+                // along with any picked-face highlight from the prior session.
+                self.features.clear();
+                self.job.model_position = [0.0, 0.0, 0.0];
+                if let (Some(rs), Some(vp)) = (&self.render_state, &mut self.viewport) {
+                    let _ = rs;
+                    vp.clear_pick();
+                }
             }
             Err(e) => self.log.push(format!("Import failed: {e}")),
         }
+    }
+
+    /// Run the verifier on every generated toolpath and log the findings.
+    /// Returns `true` if any error-level issues were found.
+    fn action_verify(&mut self) -> bool {
+        let all_paths: Vec<openmill_core::Toolpath> = self.toolpaths
+            .iter()
+            .flat_map(|v| v.iter().cloned())
+            .collect();
+        if all_paths.is_empty() {
+            self.log.push("Verify: no toolpaths generated yet.".into());
+            return false;
+        }
+        let issues = openmill_core::verify_job(
+            &all_paths,
+            &self.job.machine,
+            &self.job.tools,
+            self.model.as_ref(),
+        );
+        if issues.is_empty() {
+            self.log.push("Verify: ✓ no issues.".into());
+            return false;
+        }
+        let n_err = issues.iter().filter(|i| i.level == openmill_core::IssueLevel::Error).count();
+        let n_warn = issues.len() - n_err;
+        self.log.push(format!(
+            "Verify: {n_err} error(s), {n_warn} warning(s) — see below."
+        ));
+        for i in &issues {
+            let prefix = match i.level {
+                openmill_core::IssueLevel::Error   => "  ✗ ERROR:",
+                openmill_core::IssueLevel::Warning => "  ⚠ warn :",
+            };
+            self.log.push(format!("{prefix} {}", i.message));
+        }
+        n_err > 0
     }
 
     fn action_export_gcode(&mut self, post: &dyn PostProcessor) {
         let any_paths = self.toolpaths.iter().any(|v| !v.is_empty());
         if !any_paths {
             self.log.push("No toolpaths generated. Generate toolpaths first.".into());
+            return;
+        }
+
+        // Auto-verify before exporting. If any errors fire, refuse to write
+        // and ask the user to fix them. Warnings don't block — they're just
+        // logged.
+        if self.action_verify() {
+            self.log.push(
+                "Export aborted: verification reported errors. Fix them or use Verify menu to review."
+                .into(),
+            );
             return;
         }
 
@@ -1230,51 +1999,72 @@ impl OpenMillApp {
             return;
         };
 
+        // Inject the op-level stock-to-leave into the strategy params JSON.
+        // Strategies that have a `stock_to_leave` field will pick it up; the
+        // rest ignore the extra key. This keeps the per-op skin a single
+        // source of truth instead of forcing the user to set it twice.
+        let params_json = inject_stock_to_leave(&op.params, op.stock_to_leave);
+
         let result = match op.strategy.as_str() {
             "3+2 Indexed" => {
                 let params: ThreePlusTwoParams =
-                    serde_json::from_value(op.params.clone()).unwrap_or_default();
+                    serde_json::from_value(params_json.clone()).unwrap_or_default();
                 ThreePlusTwo.generate(model, tool, &self.job.machine, &params)
             }
             "4+1 Indexed" => {
                 let params: FourPlusOneParams =
-                    serde_json::from_value(op.params.clone()).unwrap_or_default();
+                    serde_json::from_value(params_json.clone()).unwrap_or_default();
                 FourPlusOne.generate(model, tool, &self.job.machine, &params)
             }
             "Adaptive Clearing" => {
                 let params: AdaptiveClearingParams =
-                    serde_json::from_value(op.params.clone()).unwrap_or_default();
+                    serde_json::from_value(params_json.clone()).unwrap_or_default();
                 AdaptiveClearing.generate(model, tool, &self.job.machine, &params)
             }
             "Surface Normal 5-Axis" => {
                 let params: SurfaceNormal5AxisParams =
-                    serde_json::from_value(op.params.clone()).unwrap_or_default();
+                    serde_json::from_value(params_json.clone()).unwrap_or_default();
                 SurfaceNormal5Axis.generate(model, tool, &self.job.machine, &params)
             }
             "Contour Parallel" => {
                 let params: ContourParallelParams =
-                    serde_json::from_value(op.params.clone()).unwrap_or_default();
+                    serde_json::from_value(params_json.clone()).unwrap_or_default();
                 ContourParallel.generate(model, tool, &self.job.machine, &params)
             }
             "Swarf 5-Axis" => {
                 let params: Swarf5AxisParams =
-                    serde_json::from_value(op.params.clone()).unwrap_or_default();
+                    serde_json::from_value(params_json.clone()).unwrap_or_default();
                 Swarf5Axis.generate(model, tool, &self.job.machine, &params)
             }
             "Geodesic Parallel" => {
                 let params: GeodesicParams =
-                    serde_json::from_value(op.params.clone()).unwrap_or_default();
+                    serde_json::from_value(params_json.clone()).unwrap_or_default();
                 GeodesicParallel.generate(model, tool, &self.job.machine, &params)
             }
             "5-Axis Pencil Tracing" => {
                 let params: PencilParams =
-                    serde_json::from_value(op.params.clone()).unwrap_or_default();
+                    serde_json::from_value(params_json.clone()).unwrap_or_default();
                 PencilTracing.generate(model, tool, &self.job.machine, &params)
             }
             "5-Axis Drilling" => {
                 let params: DrillingParams =
-                    serde_json::from_value(op.params.clone()).unwrap_or_default();
+                    serde_json::from_value(params_json.clone()).unwrap_or_default();
                 Drilling5Axis.generate(model, tool, &self.job.machine, &params)
+            }
+            "Tapping" => {
+                let params: TappingParams =
+                    serde_json::from_value(params_json.clone()).unwrap_or_default();
+                Tapping.generate(model, tool, &self.job.machine, &params)
+            }
+            "Thread Milling" => {
+                let params: ThreadMillingParams =
+                    serde_json::from_value(params_json.clone()).unwrap_or_default();
+                ThreadMilling.generate(model, tool, &self.job.machine, &params)
+            }
+            "Pocket Clearing" => {
+                let params: PocketClearingParams =
+                    serde_json::from_value(params_json.clone()).unwrap_or_default();
+                PocketClearing.generate(model, tool, &self.job.machine, &params)
             }
             other => {
                 self.log.push(format!("Strategy \"{other}\" is not yet implemented."));
@@ -1359,6 +2149,34 @@ impl OpenMillApp {
 
 // ── Strategy param editors ──────────────────────────────────────────────────
 
+/// Format a duration in minutes as `Hh Mm Ss` / `Mm Ss` / `Ss`. Used for
+/// per-op and job-total runtime estimates in the Operations panel.
+fn fmt_minutes(minutes: f64) -> String {
+    let total_secs = (minutes * 60.0).round() as i64;
+    let h = total_secs / 3600;
+    let m = (total_secs % 3600) / 60;
+    let s = total_secs % 60;
+    if h > 0 {
+        format!("{h}h {m}m {s}s")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// Inject the op-level `stock_to_leave` into a strategy params JSON object.
+/// Strategies whose params struct has a `stock_to_leave` field will pick this
+/// up via serde; the rest will deserialise as if the key wasn't there. Keeping
+/// this as a JSON-side mutation lets us avoid a per-strategy plumbing arm.
+fn inject_stock_to_leave(params: &serde_json::Value, value: f64) -> serde_json::Value {
+    let mut out = params.clone();
+    if let serde_json::Value::Object(obj) = &mut out {
+        obj.insert("stock_to_leave".to_string(), serde_json::json!(value));
+    }
+    out
+}
+
 fn default_params_for(strategy: &str) -> serde_json::Value {
     match strategy {
         "3+2 Indexed" => serde_json::to_value(ThreePlusTwoParams::default()).unwrap(),
@@ -1370,6 +2188,9 @@ fn default_params_for(strategy: &str) -> serde_json::Value {
         "Geodesic Parallel" => serde_json::to_value(GeodesicParams::default()).unwrap(),
         "5-Axis Pencil Tracing" => serde_json::to_value(PencilParams::default()).unwrap(),
         "5-Axis Drilling" => serde_json::to_value(DrillingParams::default()).unwrap(),
+        "Tapping" => serde_json::to_value(TappingParams::default()).unwrap(),
+        "Thread Milling" => serde_json::to_value(ThreadMillingParams::default()).unwrap(),
+        "Pocket Clearing" => serde_json::to_value(PocketClearingParams::default()).unwrap(),
         _ => serde_json::Value::Object(Default::default()),
     }
 }
@@ -1574,6 +2395,74 @@ fn show_strategy_params(
             ui.separator();
             changed |= drag(ui, "Feed rate", &mut p.feed_rate, 10.0, "mm/min");
             changed |= drag(ui, "Dwell", &mut p.dwell, 0.1, "s");
+            if changed {
+                op.params = serde_json::to_value(&p).unwrap();
+            }
+        }
+        "Tapping" => {
+            let mut p: TappingParams =
+                serde_json::from_value(op.params.clone()).unwrap_or_default();
+            let mut changed = false;
+            ui.label(format!("Holes: {} (use the Features panel to populate)", p.holes.len()));
+            if !p.holes.is_empty() && ui.button("Clear All Holes").clicked() {
+                p.holes.clear();
+                changed = true;
+            }
+            ui.separator();
+            changed |= drag(ui, "Thread pitch", &mut p.thread_pitch, 0.05, "mm/rev");
+            changed |= drag(ui, "Spindle RPM (synced)", &mut p.spindle_rpm, 10.0, "rpm");
+            changed |= drag(ui, "Peck depth (0 = full depth)", &mut p.peck_depth, 0.1, "mm");
+            changed |= drag(ui, "Dwell at bottom", &mut p.dwell, 0.1, "s");
+            ui.weak(format!(
+                "Synced feed: {:.0} mm/min  (= rpm × pitch)",
+                p.spindle_rpm * p.thread_pitch
+            ));
+            if changed {
+                op.params = serde_json::to_value(&p).unwrap();
+            }
+        }
+        "Thread Milling" => {
+            let mut p: ThreadMillingParams =
+                serde_json::from_value(op.params.clone()).unwrap_or_default();
+            let mut changed = false;
+            ui.label(format!("Holes: {} (use the Features panel to populate)", p.holes.len()));
+            if !p.holes.is_empty() && ui.button("Clear All Holes").clicked() {
+                p.holes.clear();
+                changed = true;
+            }
+            ui.separator();
+            changed |= drag(ui, "Thread Ø (major)", &mut p.thread_diameter, 0.05, "mm");
+            changed |= drag(ui, "Thread pitch", &mut p.thread_pitch, 0.05, "mm/rev");
+            changed |= drag(ui, "Thread depth", &mut p.thread_depth, 0.1, "mm");
+            changed |= drag(ui, "Feed rate", &mut p.feed_rate, 10.0, "mm/min");
+            let mut seg = p.segments_per_rev as f64;
+            if drag(ui, "Segments / rev", &mut seg, 1.0, "") {
+                p.segments_per_rev = seg.max(8.0) as usize;
+                changed = true;
+            }
+            ui.horizontal(|ui| {
+                ui.label("Direction:");
+                if ui.selectable_label(p.climb,  "Climb").clicked()        && !p.climb { p.climb = true;  changed = true; }
+                if ui.selectable_label(!p.climb, "Conventional").clicked() && p.climb  { p.climb = false; changed = true; }
+            });
+            if changed {
+                op.params = serde_json::to_value(&p).unwrap();
+            }
+        }
+        "Pocket Clearing" => {
+            let mut p: PocketClearingParams =
+                serde_json::from_value(op.params.clone()).unwrap_or_default();
+            let mut changed = false;
+            ui.label(format!("Pockets: {} (use the Features panel to populate)", p.pockets.len()));
+            if !p.pockets.is_empty() && ui.button("Clear All Pockets").clicked() {
+                p.pockets.clear();
+                changed = true;
+            }
+            ui.separator();
+            changed |= drag(ui, "Step-down", &mut p.step_down, 0.1, "mm");
+            changed |= drag(ui, "Step-over", &mut p.step_over, 0.01, "");
+            changed |= drag(ui, "Feed rate", &mut p.feed_rate, 10.0, "mm/min");
+            changed |= drag(ui, "Stock to leave", &mut p.stock_to_leave, 0.05, "mm");
             if changed {
                 op.params = serde_json::to_value(&p).unwrap();
             }

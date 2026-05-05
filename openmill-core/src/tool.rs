@@ -244,6 +244,29 @@ pub struct ToolHolder {
     pub profile: Vec<(f64, f64)>,
 }
 
+impl ToolHolder {
+    /// Linear interpolate the holder's outer radius at axial distance `z`
+    /// (measured from the holder base — i.e. from the spindle nose end of
+    /// the holder). Out-of-range queries clamp to the nearest profile point.
+    pub fn radius_at(&self, z: f64) -> f64 {
+        if self.profile.is_empty() { return 0.0; }
+        let first = self.profile[0];
+        let last  = *self.profile.last().unwrap();
+        if z <= first.0 { return first.1; }
+        if z >= last.0  { return last.1;  }
+        for w in self.profile.windows(2) {
+            let (z0, r0) = w[0];
+            let (z1, r1) = w[1];
+            if z >= z0 && z <= z1 {
+                let dz = (z1 - z0).max(1e-9);
+                let t = (z - z0) / dz;
+                return r0 + t * (r1 - r0);
+            }
+        }
+        last.1
+    }
+}
+
 // ── Tool ──────────────────────────────────────────────────────────────────────
 
 fn default_flutes() -> u32 { 2 }
@@ -322,6 +345,53 @@ impl Tool {
     }
 }
 
+// ── Holder collision detection ───────────────────────────────────────────────
+
+/// Test the **holder** silhouette against a triangle mesh at a single tool
+/// pose. Returns the world-space mesh vertex that lies inside the holder
+/// envelope, or `None` if there's no collision.
+///
+/// The holder is treated as an axisymmetric volume around the tool's local
+/// `+Z` axis (pointing from the cutting tip toward the spindle nose). The
+/// holder's `profile` (`(z, r)` pairs) describes the outer silhouette in
+/// holder-local space; this routine offsets it by the tool's `flute_length`
+/// so that `z = 0` on the profile sits at the top of the cutting region.
+///
+/// Implementation uses a per-vertex test in tool-local coordinates. For a
+/// typical CAM mesh (tens of thousands of vertices) this is fast enough to
+/// run every simulation step. Triangles whose vertices all sit outside the
+/// holder envelope but whose interior straddles it are *not* caught — for
+/// finely tessellated meshes this case is rare in practice.
+///
+/// Returns `None` immediately when the tool has no holder defined (we don't
+/// guess one — explicit holder definitions only).
+pub fn holder_collision(
+    tool: &Tool,
+    pose: &nalgebra::Isometry3<f32>,
+    mesh: &parry3d::shape::TriMesh,
+) -> Option<nalgebra::Point3<f32>> {
+    let holder = tool.holder.as_ref()?;
+    if holder.profile.is_empty() { return None; }
+
+    // Holder lives ABOVE the cutting region. Tool-local Z=0 is the tip; the
+    // holder's profile-Z = 0 sits at the top of the flutes.
+    let z_offset = tool.shape.flute_length() as f32;
+    let z_min = z_offset + holder.profile.first().unwrap().0 as f32;
+    let z_max = z_offset + holder.profile.last().unwrap().0 as f32;
+
+    let pose_inv = pose.inverse();
+    for v in mesh.vertices() {
+        let local = pose_inv * *v;
+        if local.z < z_min || local.z > z_max { continue; }
+        let r_holder = holder.radius_at((local.z - z_offset) as f64) as f32;
+        let r_vertex = (local.x * local.x + local.y * local.y).sqrt();
+        if r_vertex < r_holder {
+            return Some(*v);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,5 +408,62 @@ mod tests {
     fn tool_shape_diameter_accessor() {
         assert_eq!(ToolShape::BallEnd { diameter: 8.0, flute_length: 24.0 }.diameter(), 8.0);
         assert_eq!(ToolShape::BullNose { diameter: 12.0, corner_radius: 1.5, flute_length: 30.0 }.diameter(), 12.0);
+    }
+
+    #[test]
+    fn holder_radius_at_interpolates_linearly() {
+        let h = ToolHolder {
+            name: "test".into(),
+            profile: vec![(0.0, 25.0), (40.0, 25.0), (41.0, 10.0), (60.0, 10.0)],
+        };
+        // Midpoint between (40, 25) and (41, 10) → r = 17.5
+        assert!((h.radius_at(40.5) - 17.5).abs() < 1e-9);
+        // Below profile clamps to first.
+        assert_eq!(h.radius_at(-5.0), 25.0);
+        // Above profile clamps to last.
+        assert_eq!(h.radius_at(100.0), 10.0);
+    }
+
+    #[test]
+    fn holder_collision_detects_a_vertex_inside_envelope() {
+        use parry3d::math::Point as PPoint;
+        use parry3d::shape::TriMesh;
+        let mut tool = Tool::flat_end(1, "6 flat", 6.0, 20.0);
+        // 25mm-radius collar from z=20 (top of flutes) to z=60 in tool-local Z.
+        tool.holder = Some(ToolHolder {
+            name: "collar".into(),
+            profile: vec![(0.0, 25.0), (40.0, 25.0)],
+        });
+        // Mesh: a single triangle that has one vertex inside the holder
+        // envelope at z=30 (above the cutting region) — should collide.
+        let verts = vec![
+            PPoint::<f32>::new(10.0, 0.0, 30.0), // inside (r=10 < 25)
+            PPoint::<f32>::new(80.0, 0.0, 30.0), // outside (r=80)
+            PPoint::<f32>::new(80.0, 80.0, 30.0),
+        ];
+        let tris = vec![[0u32, 1, 2]];
+        let mesh = TriMesh::new(verts, tris);
+        let pose = nalgebra::Isometry3::identity();
+        let hit = holder_collision(&tool, &pose, &mesh);
+        assert!(hit.is_some(), "should detect the inside vertex");
+        let p = hit.unwrap();
+        assert!((p.x - 10.0).abs() < 1e-6, "wrong vertex");
+    }
+
+    #[test]
+    fn holder_collision_returns_none_with_no_holder() {
+        use parry3d::math::Point as PPoint;
+        use parry3d::shape::TriMesh;
+        let tool = Tool::flat_end(1, "6 flat", 6.0, 20.0);
+        let mesh = TriMesh::new(
+            vec![
+                PPoint::<f32>::new(0.0, 0.0, 30.0),
+                PPoint::<f32>::new(1.0, 0.0, 30.0),
+                PPoint::<f32>::new(0.0, 1.0, 30.0),
+            ],
+            vec![[0u32, 1, 2]],
+        );
+        let pose = nalgebra::Isometry3::identity();
+        assert!(holder_collision(&tool, &pose, &mesh).is_none());
     }
 }

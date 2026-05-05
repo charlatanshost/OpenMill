@@ -49,6 +49,10 @@ pub struct FourPlusOneParams {
 
     /// Cutting feed rate [mm/min].
     pub feed_rate: f64,
+
+    /// Stock to leave on the part surface [mm].
+    #[serde(default)]
+    pub stock_to_leave: f64,
 }
 
 impl Default for FourPlusOneParams {
@@ -61,6 +65,7 @@ impl Default for FourPlusOneParams {
             step_down: 1.0,
             step_over: 0.5,
             feed_rate: 700.0,
+            stock_to_leave: 0.0,
         }
     }
 }
@@ -206,6 +211,9 @@ impl ToolpathStrategy for FourPlusOne {
                             hit_lz = (safe_lz - toi as f64).max(lz_bot);
                         }
 
+                        // Stock-to-leave: hold cutting moves above the part
+                        // surface in the local-Z direction.
+                        let hit_lz = hit_lz + params.stock_to_leave.max(0.0);
                         let target_lz = lz.max(hit_lz);
                         segment_pts.push(Point3::new(clx, ly, target_lz));
                     }

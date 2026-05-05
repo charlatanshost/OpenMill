@@ -6,28 +6,41 @@
 
 ## ✨ Key Features
 
-### 🛠️ Toolpath Strategies
-OpenMill supports a range of strategies that scale from 3-axis indexed work to simultaneous 5-axis:
+### 🛠️ Toolpath Strategies (12)
+OpenMill ships strategies that scale from 3-axis indexed work to simultaneous 5-axis:
 - **3+2 Indexed**: Lock both rotary axes at fixed angles and run a stock-aware 3-axis raster in the resulting tilted plane.
 - **4+1 Indexed**: Lock A, step C between passes — ideal for wrapping operations around a part or reaching multiple faces in a single setup.
-- **Adaptive Clearing**: Stock-aware layered roughing with engagement-angle-derived step-over.
-- **Contour Parallel**: Z-level waterline finishing that scans from the stock top down through the part.
-- **Surface Normal 5-Axis**: Parallel / Scallop / Spiral / Rotary patterns with lead-angle and side-tilt control.
-- **Swarf 5-Axis**: Tool flank aligned with ruled surfaces (turbine vanes, tapered walls).
-- **Geodesic Parallel**: Surface-aware paths with constant step-over on complex geometry.
-- **5-Axis Pencil Tracing**: Concave-corner cleanup with bisecting tool tilt.
+- **Adaptive Clearing** *(roughing)*: Stock-aware layered raster with engagement-angle-derived step-over.
+- **Pocket Clearing** *(roughing)*: Bounded raster clear of detected pocket features, layer-by-layer with raycast Z-clamping.
+- **Contour Parallel** *(finishing)*: Z-level waterline that scans from the stock top down through the part.
+- **Surface Normal 5-Axis** *(finishing)*: Parallel / Scallop / Spiral / Rotary patterns with lead-angle and side-tilt control.
+- **Swarf 5-Axis** *(finishing)*: Tool flank aligned with ruled surfaces (turbine vanes, tapered walls).
+- **Geodesic Parallel** *(finishing)*: Surface-aware paths with constant step-over on complex geometry.
+- **5-Axis Pencil Tracing** *(finishing)*: Concave-corner cleanup with bisecting tool tilt.
 - **5-Axis Drilling**: Tool axis automatically aligned to each hole's drill axis.
+- **Tapping**: Rigid-tap cycles with synchronised feed (`feed = rpm × pitch`) and optional pecking.
+- **Thread Milling**: Helical interpolation with climb / conventional toggle and configurable segments per revolution.
 
 All roughing strategies are **stock-aware** — they plan from the stock envelope (part AABB grown by margin, or cylinder bounds), not just the part shape, so the outer stock margin actually gets cleared.
+
+Every operation carries a **stock-to-leave** value (mm) that's automatically injected into the strategy params at generate time, so you can rough with `0.3 mm` and follow with a finishing op at `0.0` without juggling the same number in two places.
+
+### 🔍 Feature Recognition & Manual Picking
+A first-class **Features** pipeline that turns mesh geometry into op inputs:
+- **Auto-detect Holes**: scans the mesh for vertical cylindrical walls and emits hole features (position, axis, diameter, depth).
+- **Auto-detect Pockets**: finds horizontal floor faces with open clearance above and emits pocket features (centre, floor Z, top Z, radius, area).
+- **🎯 Pick Face Mode**: click any face in the viewport — the picker raycasts the mesh, flood-fills coplanar neighbours, auto-classifies the cluster (pocket / hole / generic flat), and lights it up amber.
+- **Per-feature assignment**: each row exposes **→ Drilling / → Tapping / → Thread Mill / → Pocket Clearing** to push the feature onto the matching op type, with bulk-assign shortcuts for "all detected holes → drilling".
 
 ### 🧰 Professional Tool Management
 A persistent Tool Library system with full feed-and-speed planning:
 - **Persistent Storage**: Tools auto-save to `tools/tool_<id>.json` and load on startup.
-- **Rich Geometry**: Flat, Ball, Bull-Nose, Chamfer, Drill, Tapered, Lollipop, Dovetail, and Thread-Mill shapes — each with proper 2D profile preview.
+- **Rich Geometry**: Flat, Ball, Bull-Nose, Chamfer, Drill, Tapered, Lollipop, Dovetail, and Thread-Mill shapes — each with proper auto-scaling 2D profile preview.
 - **Feed/Speed Presets**: Save named presets per tool (RPM, cutting feed, plunge feed, coolant). One click applies a preset to the active operation.
 - **Starter Presets**: Each new tool is auto-seeded with starter presets for common materials (6061 Aluminum, Mild Steel, HDPE, Hardwood, Brass) computed from the tool's diameter and flute count.
 - **Coolant Modes**: None / Mist (M7) / Flood (M8) / Mist+Flood / Through-spindle (M88), wired through to G-code emission.
 - **Tool-Change G-code**: Per-tool free-form G-code injected after every M6 (probing routines, length offsets, etc.).
+- **Tool-Holder Collision**: Define a holder profile and the simulator checks the holder envelope against the part mesh on every step — catches the most common 5-axis crash mode.
 
 ### 🏗️ Machine Library
 Define your machine's physical constraints and post-processing defaults:
@@ -36,12 +49,21 @@ Define your machine's physical constraints and post-processing defaults:
 - **Pivot Configuration**: Customizable trunnion pivot offsets for table-table kinematics.
 - Configurations persist as `machines/<name>.json`.
 
+### 📐 Stock & Model Setup
+- **Absolute stock dimensions** in mm or **decimal inches** (1.5 in, 2.375 in — not fractions). Internal storage is always mm; the unit toggle is display-only.
+- **Stock auto-tracks the part**: the stock envelope is derived from the part AABB grown by per-axis margin (or cylinder bounds) and updates automatically when the model moves.
+- **Model position editor**: translate the part anywhere in the work area with X/Y/Z drag values, **⟲ Reset** to imported origin, **⌖ Centre on origin** to drop the AABB centroid at (0,0,0). Position persists across save/load.
+
 ### 🎮 Real-Time Simulation
 Two distinct viewport modes, switchable from the bottom panel:
 - **🧭 Plan View**: Solid part mesh visible for path setup and toolpath review. No carving runs.
 - **🛠 Simulation View**: Hides the part mesh and shows the **voxel stock** as it gets carved by the tool body's full swept volume. The part is overlaid as a translucent red **X-ray ghost** so collisions between tool and finished part are visible even when stock material is still in front.
 - **GPU compute carving**: WGSL compute shader sweeps the full tool body (not just the tip) along the tool axis at every move, with gradient-shaded surface normals so cavities and step-down terraces are clearly visible.
-- **Live tool-mesh collision detection** powered by `parry3d` raycasting; collisions render as red markers in 3D.
+- **Live tool-mesh + holder collision detection** via `parry3d` raycasting and the holder envelope check; collisions render as red markers in 3D.
+
+### ✓ Verification & Estimates
+- **Pre-export verifier** — auto-runs before every G-code export and refuses to write on errors. Checks travel limits (X/Y/Z), rotary range (A/C via IK), undefined / implausibly-high feeds, cuts below part floor, and tool-holder collisions sampled along the path.
+- **Estimated machining time** per operation and a job-wide total, shown in the Operations panel as `Hh Mm Ss`.
 
 ### 📄 Flexible Post-Processing
 - Native support for **LinuxCNC** (RS274NGC) and **GRBL**.
@@ -51,14 +73,17 @@ Two distinct viewport modes, switchable from the bottom panel:
 - **Inverse-time feed near singularities**: rotary-axis velocity clamped to a configurable max so near-vertical-axis moves slow naturally instead of commanding infinite C-axis velocity.
 - **Custom post-processor API** for extending to other controllers via the `PostProcessor` trait.
 
+### 💾 Job Save / Load
+Round-trip a full job (stock, model position, tools, operations, features, machine config) as a single JSON file. Reopen the job later and everything is back: model in the right position, ops in the right order, presets attached.
+
 ## 🏗️ Architecture
 
 | Crate | Responsibility |
 |---|---|
-| [`openmill-core`](./openmill-core) | Geometry, kinematics, model + stock, toolpath types, **strategies**. |
+| [`openmill-core`](./openmill-core) | Geometry, kinematics, model + stock + position, **strategies**, **features**, **verifier**, toolpath types. |
 | [`openmill-sim`](./openmill-sim) | Material-removal simulation primitives. |
 | [`openmill-post`](./openmill-post) | G-code dialects (LinuxCNC, GRBL), inverse-time feed math, per-op preamble/postamble. |
-| [`openmill-ui`](./openmill-ui) | Desktop GUI built with `egui` + `wgpu`; voxel carving & raymarched stock rendering. |
+| [`openmill-ui`](./openmill-ui) | Desktop GUI built with `egui` + `wgpu`; voxel carving & raymarched stock rendering, ghost-mesh X-ray, click-to-pick. |
 
 ## 🚀 Getting Started
 
@@ -83,12 +108,16 @@ On Windows you can also use the included `launch.bat`.
 
 ### First-Job Walkthrough
 1. **File → Import Model** an STL or 3MF.
-2. Open the **Tools** tab and confirm the tool library; tweak feed/speed presets if needed.
-3. Configure stock margin in the **Stock** section of the side panel.
-4. Add an operation: pick a strategy, pick a tool, optionally apply a feed/speed preset.
-5. Click **Generate Toolpath** — the path renders in the viewport in Plan view.
-6. Switch to **🛠 Simulation** view, press Play, and watch the stock get carved.
-7. **File → Export G-code** writes the program to `.nc` / `.ngc` / `.gcode`.
+2. (Optional) **Position** the model in the work area or **⌖ Centre on origin**.
+3. Configure stock dimensions (mm or decimal inch) in the **Stock** section.
+4. Open the **Tools** tab and confirm the tool library; tweak feed/speed presets if needed.
+5. In **Features**, click **🔍 Holes** / **🔍 Pockets** to auto-detect, or toggle **🎯 Pick Face Mode** to click features manually.
+6. Add an operation: pick a strategy, pick a tool, optionally apply a feed/speed preset, set **Stock to leave** for roughing.
+7. For feature-driven ops (Drilling, Tapping, Thread Milling, Pocket Clearing), use the **→** buttons in the Features panel to assign features to the selected op.
+8. Click **Generate Toolpath** — the path renders in the viewport in Plan view.
+9. Switch to **🛠 Simulation** view, press Play, and watch the stock get carved (with the part visible as a translucent ghost).
+10. **Verify → ✓ Verify all toolpaths** (or just hit Export — verification runs automatically).
+11. **File → Save Job...** to keep the setup, or **Export → Machine Default** to write the `.nc` / `.ngc` / `.gcode`.
 
 ## 🤝 Contributing
 Contributions are welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the development workflow and roadmap.

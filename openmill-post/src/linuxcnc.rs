@@ -302,6 +302,7 @@ mod tests {
             plunge_rate: 200.0,
             coolant: openmill_core::Coolant::Flood,
             gcode_command: "G43 H1".into(),
+            stock_to_leave: 0.0,
             enabled: true,
         };
         let pre = post.op_preamble(&op, &tool);

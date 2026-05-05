@@ -23,24 +23,65 @@ pub enum StockShape {
 
 /// A loaded part model plus stock definition used by toolpath strategies.
 ///
-/// The `mesh` is the **finished** part shape; `stock` describes what material
-/// we start from.  Strategies plan cuts to remove all material outside `mesh`
-/// that is inside `stock`.
+/// The `mesh` is the **finished** part shape, in **workpiece coordinates**
+/// — that is, the import mesh translated by `position`. Strategies use
+/// `mesh` and `aabb` directly without thinking about positioning.
+///
+/// `stock` describes what material we start from. Stock is always derived
+/// from the part AABB (grown by margin or wrapped by a cylinder) so it
+/// follows the part automatically when `position` changes.
 pub struct WorkpieceModel {
-    /// Triangulated mesh of the finished part (parry3d f32 precision).
+    /// Triangulated mesh of the finished part **with `position` baked in**
+    /// (parry3d f32 precision).
     pub mesh: TriMesh,
     /// Axis-aligned bounding box of `mesh` in workpiece coordinates.
     pub aabb: Aabb,
     /// Raw-material stock shape.
     pub stock: StockShape,
+
+    /// Original imported mesh (before any position offset). Stored so the
+    /// user can move the model around the work area without compounding
+    /// translations.
+    pub mesh_orig: TriMesh,
+    /// Translation applied to `mesh_orig` to place the part in the work
+    /// area. Defaults to zero. Use [`set_position`] to update — that
+    /// rebuilds `mesh` and `aabb` from `mesh_orig`.
+    pub position: Vector3<f64>,
 }
 
 impl WorkpieceModel {
-    /// Build from a pre-constructed mesh and stock.  AABB is computed from
-    /// the mesh automatically.
+    /// Build from a pre-constructed mesh and stock. AABB is computed from
+    /// the mesh automatically. The imported mesh is stored both as the
+    /// raw original (for re-positioning) and as the active workpiece-coord
+    /// mesh (initially identical — `position` defaults to zero).
     pub fn new(mesh: TriMesh, stock: StockShape) -> Self {
         let aabb = *mesh.local_aabb();
-        WorkpieceModel { mesh, aabb, stock }
+        WorkpieceModel {
+            mesh: mesh.clone(),
+            aabb,
+            stock,
+            mesh_orig: mesh,
+            position: Vector3::zeros(),
+        }
+    }
+
+    /// Move the part in the work area. Rebuilds `mesh` and `aabb` from
+    /// `mesh_orig` translated by `position`. Stock follows automatically
+    /// because it's always derived from the (now-updated) part AABB.
+    pub fn set_position(&mut self, position: Vector3<f64>) {
+        let dx = position.x as f32;
+        let dy = position.y as f32;
+        let dz = position.z as f32;
+        let translated_verts: Vec<PPoint<f32>> = self
+            .mesh_orig
+            .vertices()
+            .iter()
+            .map(|v| PPoint::new(v.x + dx, v.y + dy, v.z + dz))
+            .collect();
+        let translated_tris: Vec<[u32; 3]> = self.mesh_orig.indices().to_vec();
+        self.mesh = TriMesh::new(translated_verts, translated_tris);
+        self.aabb = *self.mesh.local_aabb();
+        self.position = position;
     }
 
     /// Convenience: bounding-box stock with a uniform margin on all sides [mm].

@@ -141,6 +141,26 @@ impl Toolpath {
             }
         })
     }
+
+    /// Estimated runtime of this toolpath in **minutes**.
+    ///
+    /// For each segment:
+    /// - cutting moves use the segment's `feed_rate` (mm/min);
+    /// - rapids use `rapid_mm_per_min` — pass the machine's rapid speed
+    ///   (LinuxCNC default ≈ 5000 mm/min, hobby grbl ≈ 1500).
+    ///
+    /// Excludes acceleration/deceleration and tool changes — it's a
+    /// programmer's estimate, not a controller-accurate dispatch time.
+    pub fn duration_minutes(&self, rapid_mm_per_min: f64) -> f64 {
+        self.points.windows(2).fold(0.0, |acc, w| {
+            let dist = w[0].distance_to(&w[1]);
+            let rate = match w[1].move_type {
+                MoveType::Rapid | MoveType::Retract => rapid_mm_per_min.max(1.0),
+                _ => w[1].feed_rate.max(1.0),
+            };
+            acc + dist / rate
+        })
+    }
 }
 
 #[cfg(test)]
@@ -180,5 +200,31 @@ mod tests {
         });
         // Only the Linear segment (length = 10) counts.
         assert!((tp.cutting_length() - 10.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn toolpath_duration_minutes() {
+        // 3 points → 2 segments:
+        //   (p0 → p1): destination is Retract → uses rapid rate (5000).
+        //              dist = 5 mm,  time = 5/5000 = 0.001 min.
+        //   (p1 → p2): destination is Linear at 1000 mm/min.
+        //              dist = 10 mm, time = 10/1000 = 0.010 min.
+        // Total: 0.011 min.
+        let mut tp = Toolpath::new(1, OperationType::Roughing, "t");
+        tp.points.push(ToolpathPoint::rapid(Point3::new(0.0, 0.0, 5.0)));
+        tp.points.push(ToolpathPoint {
+            position: Point3::new(0.0, 0.0, 0.0),
+            orientation: Vector3::z_axis(),
+            feed_rate: 600.0,
+            move_type: MoveType::Retract,
+        });
+        tp.points.push(ToolpathPoint {
+            position: Point3::new(10.0, 0.0, 0.0),
+            orientation: Vector3::z_axis(),
+            feed_rate: 1000.0,
+            move_type: MoveType::Linear,
+        });
+        let t = tp.duration_minutes(5000.0);
+        assert!((t - 0.011).abs() < 1e-9, "expected 0.011 min, got {t}");
     }
 }

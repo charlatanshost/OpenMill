@@ -1,36 +1,41 @@
 # OpenMill User Guide & Technical Manual
 
-Welcome to the comprehensive guide for OpenMill. This document covers the toolpath strategies, simulation pipeline, post-processing rules, and developer-facing extension points.
+Welcome to the comprehensive guide for OpenMill. This document covers the toolpath strategies, feature recognition, simulation pipeline, post-processing rules, and developer-facing extension points.
 
 ---
 
 ## 1. Toolpath Strategies
 
-OpenMill ships nine strategies covering 3-axis indexed work, 3+2 / 4+1 indexed milling, and simultaneous 5-axis. **Roughing strategies are stock-aware** — they plan from the stock envelope (part AABB grown by margin, or cylinder bounds), not just the part footprint, so the outer stock margin actually gets cleared.
+OpenMill ships **12 strategies** covering 3-axis indexed work, 3+2 / 4+1 indexed milling, simultaneous 5-axis, and feature-driven cycles. **Roughing strategies are stock-aware** — they plan from the stock envelope (part AABB grown by margin, or cylinder bounds), not just the part footprint, so the outer stock margin actually gets cleared.
 
 ### 3+2 Indexed
 The table is locked at fixed `(A, C)` angles for the entire operation. A 3-axis zigzag raster runs in the resulting tilted plane.
 - **Use when:** every face of the part is reachable at one fixed orientation, or for a single side of a fixturing setup.
 - **Output:** rotary index move (`G0 A C`) followed by 3-axis cuts in `G94` feed-per-minute.
-- **Parameters:** `A angle`, `C angle`, `Step-down`, `Step-over` (fraction of tool diameter), `Feed rate`.
+- **Parameters:** `A angle`, `C angle`, `Step-down`, `Step-over` (fraction of tool diameter), `Feed rate`, `Stock to leave`.
 
 ### 4+1 Indexed
 The A axis is locked at a fixed tilt; the C axis is **stepped** between passes — each row of cuts uses a different C angle.
 - **Use when:** wrapping operations around a cylinder, or sweeping a partial cone, in a single setup without re-fixturing.
 - **Output:** one toolpath per C-index position, each emitting its own rotary index move and 3-axis raster.
-- **Parameters:** `A angle (fixed)`, `C start`, `C step`, `C range`, `Step-down`, `Step-over`, `Feed rate`.
+- **Parameters:** `A angle (fixed)`, `C start`, `C step`, `C range`, `Step-down`, `Step-over`, `Feed rate`, `Stock to leave`.
 
 ### Adaptive Clearing (Roughing)
 Stock-aware layered raster pocket-clear with engagement-angle-driven step-over.
 - **Step-over derivation:** `WoC = D · sin(θ/2)` where θ is the configured max engagement angle.
 - **Z range:** scans from the **stock top** down to the part bottom, clamping each layer to the part surface via raycast so it never gouges.
 - **Status:** this is a starter implementation — true trochoidal medial-axis paths require a 2D voronoi solver and are still future work. The output is a layered raster but it produces valid stock-aware G-code today.
-- **Parameters:** `Max engagement` (deg), `Step-down`, `Feed rate`.
+- **Parameters:** `Max engagement` (deg), `Step-down`, `Feed rate`, `Stock to leave`.
+
+### Pocket Clearing (Roughing)
+Bounded raster clear of a list of detected **pocket features** (see §2). For each pocket, a layered raster runs inside its circular footprint with raycast Z-clamping to the actual mesh surface so walls and floor edges aren't gouged.
+- **Use when:** you want to clear a specific cavity rather than the whole stock volume — typically combined with Adaptive Clearing on the surrounding stock.
+- **Parameters:** `Step-down`, `Step-over`, `Feed rate`, `Stock to leave`. Pockets are populated by the Features panel.
 
 ### Contour Parallel (Waterline)
-Z-level finishing that scans from the **stock top** down to the part bottom. At each Z level it raycasts inward from the stock perimeter, offsets by tool radius, and emits a perimeter pass.
+Z-level finishing that scans from the **stock top** down to the part bottom. At each Z level it raycasts inward from the stock perimeter, offsets by tool radius (plus any stock-to-leave skin), and emits a perimeter pass.
 - **Use when:** finishing vertical or near-vertical walls.
-- **Parameters:** `Step-down`, `Feed rate`, `Tolerance`.
+- **Parameters:** `Step-down`, `Feed rate`, `Tolerance`, `Stock to leave`.
 
 ### Surface Normal 5-Axis (Finishing)
 Simultaneous 5-axis finishing where the tool axis is tilted to follow (or offset from) the surface normal at each contact point.
@@ -43,6 +48,7 @@ Simultaneous 5-axis finishing where the tool axis is tilted to follow (or offset
     - `Lead Angle`: tilts the tool forward in the direction of travel.
     - `Tilt Angle`: tilts the tool sideways.
     - *Tip:* a small lead angle on a ball-end mill avoids cutting with the zero-surface-speed tip.
+- **Stock to leave** offsets each contact point along the surface normal (with `tool_r + skin` for ball-end tools).
 
 ### Swarf 5-Axis (Flank Machining)
 The cutter side is held tangent to a ruled surface — turbine vanes, blade edges, tapered walls.
@@ -61,26 +67,84 @@ Detects concave edges by the dihedral angle between adjacent triangles and trace
 
 ### 5-Axis Drilling
 Plunge-retract cycles where the tool axis aligns with each hole's drill axis.
-- **Hole editor:** add/remove holes with explicit `(X, Y, Z)` position, `(X, Y, Z)` axis vector, and `Depth`. New holes default to the loaded model's top centre pointing −Z.
+- **Hole editor:** add/remove holes manually with explicit `(X, Y, Z)` position, `(X, Y, Z)` axis vector, and `Depth`. New holes default to the loaded model's top centre pointing −Z. Detected hole features can also be assigned via the Features panel.
 - **Output:** rapid to safe height → linear plunge to depth → retract.
 
+### Tapping
+Rigid-tap cycles. Synchronised feed rate is derived from `feed = rpm × pitch`.
+- **Parameters:** `Thread pitch` (mm/rev), `Spindle RPM (synced)`, `Peck depth` (0 = full-depth single pass), `Dwell at bottom` (s).
+- **Hole input:** populated from detected hole features via the Features panel.
+
+### Thread Milling
+Helical interpolation of a thread mill around the bore of each hole. The helix is discretised into `segments_per_rev` linear segments per revolution — portable across controllers without true `G2`/`G3` support.
+- **Parameters:** `Thread Ø (major)`, `Thread pitch`, `Thread depth`, `Feed rate`, `Segments / rev`, `Direction` (climb / conventional).
+- **Hole input:** populated from detected hole features via the Features panel.
+
 ---
 
-## 2. Stock-Aware Roughing
+## 2. Feature Recognition & Manual Picking
 
-Every model in OpenMill has both a **part AABB** (the loaded mesh) and a **stock AABB** (the envelope of raw material before cutting). Roughing strategies must plan from the stock envelope or the outer margin never gets cleared.
+The **Features panel** (left side panel) turns mesh geometry into op inputs.
 
-`WorkpieceModel::stock_aabb()` returns the right bounds for whichever stock shape is configured:
+### Auto-detection
+- **🔍 Holes** — `detect_holes(&TriMesh)` finds connected clusters of near-horizontal-normal triangles whose normals point inward toward a common axis. Filters by triangle count, diameter range (0.2–200 mm), depth (≥ 0.5 mm), and an inward-normal vote (≥ 70% of cluster normals point toward the cluster centroid). Vertical-axis holes only.
+- **🔍 Pockets** — `detect_pockets(&TriMesh)` finds connected clusters of horizontal up-facing triangles below the model top, then raycasts straight up from the cluster centroid to verify there's clearance above.
 
-- **`StockShape::BoundingBox { margin }`** — part AABB grown by the per-axis margin.
+### Manual face picking
+- **🎯 Pick Face Mode** toggles a click-to-pick mode in the viewport. Click any face — the picker raycasts the mesh, flood-fills coplanar neighbours (within ~5° dihedral tolerance), and emits an auto-classified feature:
+    - normal `nz > 0.7` and below model top → **Pocket**
+    - `|nz| < 0.35` with depth ≥ 0.5 mm → **Hole**
+    - everything else → **FlatFace**
+- The picked cluster is highlighted **amber** in the viewport. **Drag still orbits** the camera; only discrete left-clicks pick.
+
+### Assigning to operations
+Each feature row exposes context-appropriate **→** buttons:
+- Holes → **Drilling**, **Tapping**, **Thread Mill**
+- Pockets → **Pocket Clearing**
+
+A bulk-assign row groups all matching features and lets you replace an op's feature list in one click.
+
+---
+
+## 3. Stock-Aware Roughing
+
+Every model has both a **part AABB** (the loaded mesh) and a **stock AABB** (the envelope of raw material). `WorkpieceModel::stock_aabb()` returns the right bounds:
+
+- **`StockShape::BoundingBox { margin }`** — part AABB grown by per-axis margin.
 - **`StockShape::Cylinder { diameter, height }`** — cylinder envelope centred on the part footprint.
 
-Strategies that use the stock AABB: 3+2, 4+1, Adaptive Clearing, Contour Parallel.
-Strategies that use the part AABB: Surface Normal, Geodesic, Swarf, Pencil, Drilling (these work at the part surface by design).
+Strategies that use the **stock AABB**: 3+2, 4+1, Adaptive Clearing, Contour Parallel.
+Strategies that use the **part AABB**: Surface Normal, Geodesic, Swarf, Pencil, Drilling, Tapping, Thread Milling (these work at the part surface by design). Pocket Clearing uses each pocket feature's own bounds.
+
+### Stock to Leave
+Each operation carries a `stock_to_leave` field (mm) that's automatically injected into the strategy params at generate time. Strategies that have a `stock_to_leave` field pick it up; the rest ignore the extra key.
+
+Workflow:
+1. **Roughing** op (e.g. Adaptive Clearing): `stock_to_leave = 0.3 mm` — leaves a 0.3 mm skin everywhere.
+2. **Finishing** op (e.g. Contour Parallel): `stock_to_leave = 0.0 mm` — skims the skin off to size.
+
+Strategies honour the skin by lifting cutting moves above the part surface (3-axis Z clamp) or by offsetting along the surface normal (Contour Parallel, Surface Normal 5-Axis).
 
 ---
 
-## 3. Tool Library
+## 4. Stock & Model Setup
+
+### Stock Dimensions
+The Stock section supports both **mm** and **decimal inch** (e.g. 1.5 in, 2.375 in — never fractions) via a unit toggle. Internal storage is always millimetres.
+
+When a model is loaded, the editor shows the **absolute stock dimensions** (W × D × H) and derives the symmetric per-axis margin under the hood: `margin[i] = (stock_size[i] − part_size[i]) / 2`. Without a model, the editor falls back to per-side margin entry.
+
+### Model Position
+The **Model position** sub-section translates the part anywhere in the work area:
+- X / Y / Z drag values in the current unit.
+- **⟲ Reset** moves back to the imported origin.
+- **⌖ Centre on origin** drops the AABB centroid at `(0, 0, 0)`.
+
+Position changes immediately rebuild the in-memory mesh from `mesh_orig` translated by the offset, re-upload to the viewport, and re-upload the stock wireframe (which auto-tracks the new AABB). The position is persisted to the job so save/load round-trips preserve it.
+
+---
+
+## 5. Tool Library
 
 Tools persist as JSON in the `tools/` directory. The library auto-loads on startup.
 
@@ -133,9 +197,12 @@ Apply a preset to an operation from the operation editor — the preset's `RPM`,
 ### Tool-Change G-code
 Each tool can carry a free-form `tool_change_gcode` string. After the post emits `M6 T#` (LinuxCNC) or `M0` pause (GRBL), every line of this string is appended to the program. Use it for probing routines, applying tool-length offsets (`G43 H<n>`), homing rotary axes, or anything else specific to that tool's setup.
 
+### Holder Definition & Collision
+The `ToolHolder` profile is a `Vec<(z, r)>` describing the holder silhouette in tool-local coordinates. The simulator runs `holder_collision(tool, pose, mesh)` on every step — for each pose it transforms mesh vertices into tool-local space and reports any vertex inside the holder envelope. Without a holder defined, no holder check runs.
+
 ---
 
-## 4. Operation Editor
+## 6. Operation Editor
 
 An operation pairs a tool with a strategy and adds runtime context the strategy doesn't know about:
 
@@ -143,6 +210,7 @@ An operation pairs a tool with a strategy and adds runtime context the strategy 
 - **Feed** (mm/min cutting). `0.0` = use whatever the strategy embeds in each toolpath point.
 - **Plunge** (mm/min lead-in). `0.0` = use `feed × 0.5`.
 - **Coolant** (see table above)
+- **Stock to leave** (mm) — auto-injected into strategy params at generate time.
 - **Custom op G-code** — multi-line free-form text injected after the spindle/coolant come on. Common uses: tool-length offset (`G43 H1`), datum shift, fixture probing.
 
 The **Preset** dropdown lists every preset on the operation's tool. Picking one writes spindle / feed / plunge / coolant onto the op in one click.
@@ -152,9 +220,13 @@ Feed-rate overrides are applied via `Toolpath::with_op_feeds(cutting, plunge)`:
 - `MoveType::LeadIn` gets the plunge feed.
 - Strategy-supplied feeds are preserved when the op-level value is `0.0`.
 
+Operations are reorderable with **⬆ / ⬇** buttons in the list. Reordering swaps both the operation and its generated toolpath, updates `selected_op` so focus follows the moved op, and forces a sim rebuild on the next entry to Simulation view (op order changes the stock progression).
+
+Each row also shows a **per-op estimated runtime** (e.g. `[3m 22s]`); the panel header shows the **job-wide total**.
+
 ---
 
-## 5. Plan vs Simulation View
+## 7. Plan vs Simulation View
 
 The viewport has two distinct modes, switchable from the bottom panel:
 
@@ -184,14 +256,37 @@ for each height h in [0..flute_length]:
 The cutting length is the tool's flute length — the shank above doesn't carve. Without this multi-sample sweep, only a thin tube along the tip path got removed and the bulk of the stock looked unchanged.
 
 ### Voxel Rendering
-Surface normals are computed from the gradient of the voxel field (central differences across one voxel) so concave cavities (where stock was removed) render visibly distinct from the convex outer faces. Without this every voxel surface had identical shading and the stock appeared static even while carving.
+Surface normals are computed from the gradient of the voxel field (central differences across one voxel) so concave cavities (where stock was removed) render visibly distinct from the convex outer faces.
 
 ### Collision Detection
-Each simulation step casts a ray from the previous tool tip to the current tip against `model.mesh`. Hits get logged as red 3D-cross markers. The translucent ghost mesh in Sim view makes the actual collision geometry visible at all times.
+Each simulation step runs:
+- **Tip-path raycast** from the previous tool-tip position to the current one, against `model.mesh`.
+- **Holder envelope check** at the current pose, transforming mesh vertices into tool-local space and testing against the holder profile.
+
+Hits get logged as red 3D-cross markers. The translucent ghost mesh in Sim view makes the actual collision geometry visible at all times.
 
 ---
 
-## 6. Post-Processing
+## 8. Verification & Time Estimates
+
+### Verification
+**Verify → ✓ Verify all toolpaths** runs `verify_job(toolpaths, machine, tools, model)` and logs a list of `Issue { level, message, toolpath_idx, point_idx }`. Errors are prefixed `✗ ERROR:`, warnings `⚠ warn :`. Checks include:
+- Linear axis limits per point (X / Y / Z).
+- Rotary range (A / C) via IK, skipped near the singularity where the post emits `A=0 C=0` itself.
+- `MoveType::Linear` / `LeadIn` / `LeadOut` with `feed_rate <= 0` (error) or implausibly high feed (warning).
+- Cuts below the part floor (warning).
+- Holder collisions sampled along the toolpath (error).
+
+**Export auto-runs the verifier** and refuses to write G-code if any **errors** fire. Warnings don't block export — they're just logged. You can always run Verify manually to triage warnings before exporting.
+
+### Time Estimates
+`Toolpath::duration_minutes(rapid_mm_per_min)` sums `distance / rate` per segment, using the segment feed for cuts and a configurable rapid speed for `Rapid` / `Retract` moves (UI defaults to **5000 mm/min**). The Operations panel shows per-op time and a job-wide total formatted as `Hh Mm Ss`.
+
+This is a programmer's estimate — it doesn't model acceleration / deceleration or tool changes. Real machine time is typically 5–15% higher.
+
+---
+
+## 9. Post-Processing
 
 OpenMill translates internal toolpaths into machine-ready G-code via the `PostProcessor` trait. Two dialects ship out of the box.
 
@@ -239,21 +334,27 @@ For each `G1` segment in continuous mode, the F-word is `1.0 / time_in_minutes`,
 
 ---
 
-## 7. Saving and Loading
+## 10. Saving and Loading
 
 | Object | Where | Format |
 |---|---|---|
 | Tools | `tools/tool_<id>.json` | one tool per file, auto-loaded on startup |
 | Machines | `machines/<name>.json` | one config per file, loaded into the Machine Library |
-| Job (model + ops) | `*.omj` (planned) | full job export — *currently in-memory only between sessions* |
+| Job | `*.json` | full job export — model path, position, stock, ops, features, tools, machine, settings |
 
-Existing tool JSON files keep working when new fields are added — every new field on `Tool`, `Operation`, etc. is `#[serde(default)]`.
+**File → Save Job…** writes the entire `Job` struct as JSON. **File → Open Job…** reads it back and:
+1. Resets live state (selection, features, voxel sim, viewport overlays).
+2. Sets `self.job` first so subsequent state derives from the loaded job.
+3. Loads the model from `model_path` (relative to the job file's directory).
+4. Re-applies the saved `model_position` after the model loads, then re-uploads mesh and stock.
+
+Existing tool / machine / job JSON files keep working when new fields are added — every new field is `#[serde(default)]`.
 
 ---
 
-## 8. Technical Architecture for Developers
+## 11. Technical Architecture for Developers
 
-OpenMill is built around small, well-typed traits. Two extension points cover most additions:
+OpenMill is built around small, well-typed traits. Two extension points cover most additions.
 
 ### Adding a Strategy
 Implement [`ToolpathStrategy`](./openmill-core/src/strategies/traits.rs) in `openmill-core`:
@@ -274,7 +375,7 @@ pub trait ToolpathStrategy {
 
 Then register it in `strategies/mod.rs`, add its name to the `STRATEGIES` list in `openmill-ui/src/app.rs`, and wire up the dispatch arm + the params editor.
 
-For roughing strategies, use `model.stock_aabb()` for scan bounds. For finishing, `model.aabb` is correct.
+For roughing strategies, use `model.stock_aabb()` for scan bounds. For finishing, `model.aabb` is correct. If your strategy honours `stock_to_leave`, add a `pub stock_to_leave: f64` field with `#[serde(default)]` and the UI will auto-inject the op-level value at generate time.
 
 ### Adding a Post-Processor
 Implement [`PostProcessor`](./openmill-post/src/traits.rs):
@@ -293,14 +394,17 @@ pub trait PostProcessor {
 
 Each `process_toolpath` line is paired with the source point index so the UI can map clicks in the G-code terminal back to simulation playhead positions.
 
+### Adding a Feature Detector
+Detectors live in [`openmill-core/src/feature.rs`](./openmill-core/src/feature.rs) and produce `Vec<Feature>`. The existing detectors (`detect_holes`, `detect_pockets`) are heuristic: classify triangles by normal direction → flood-fill connected components → filter by geometry → emit `FeatureKind` instances. Manual picking goes through `pick_face(mesh, ray, tol_deg) → PickedFace` which raycasts (Möller–Trumbore) and flood-fills coplanar neighbours.
+
 ### Raycasting & Geometry
-Powered by `parry3d`. Used for tool-mesh collision detection, surface raycasting in roughing/finishing strategies, and AABB queries.
+Powered by `parry3d`. Used for tool-mesh collision detection, surface raycasting in roughing/finishing strategies, AABB queries, and feature detection.
 
 ### Workspace Map
-- **`openmill-core`** — geometry, kinematics (`TableTable` IK), `WorkpieceModel`, `StockShape`, strategies, tool & feed-speed types.
+- **`openmill-core`** — geometry, kinematics (`TableTable` IK), `WorkpieceModel`, `StockShape`, strategies, **features**, **verifier**, tool & feed-speed types, holder collision.
 - **`openmill-post`** — `PostProcessor` trait, `LinuxCncPost`, `GrblPost`, inverse-time feed math.
 - **`openmill-sim`** — simulation primitives.
-- **`openmill-ui`** — `egui` desktop app, `wgpu` viewport, voxel volume + raymarched stock shader, ghost-mesh X-ray pipeline.
+- **`openmill-ui`** — `egui` desktop app, `wgpu` viewport, voxel volume + raymarched stock shader, ghost-mesh X-ray pipeline, click-to-pick face selection.
 
 ---
 

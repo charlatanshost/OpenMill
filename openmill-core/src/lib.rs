@@ -1,3 +1,4 @@
+pub mod feature;
 pub mod fixture;
 pub mod import;
 pub mod job;
@@ -8,8 +9,12 @@ pub mod model;
 pub mod strategies;
 pub mod tool;
 pub mod toolpath;
+pub mod verify;
 
 // Flat re-exports for convenience.
+pub use feature::{
+    detect_holes, detect_pockets, feature_to_hole, pick_face, Feature, FeatureKind, PickedFace,
+};
 pub use fixture::{Fixture, FixtureShape};
 pub use import::{import_3mf, import_stl};
 pub use job::{Job, JobSettings, Operation, StockDef};
@@ -24,8 +29,13 @@ pub use strategies::{
     AdaptiveClearing, AdaptiveClearingParams, ContourParallel, ContourParallelParams,
     Drilling5Axis, DrillingParams, DrivePattern, FourPlusOne, FourPlusOneParams,
     GeodesicParallel, GeodesicParams,
-    PencilTracing, PencilParams, SurfaceNormal5Axis, SurfaceNormal5AxisParams,
-    Swarf5Axis, Swarf5AxisParams, ThreePlusTwo, ThreePlusTwoParams, ToolpathStrategy,
+    PencilTracing, PencilParams, PocketClearing, PocketClearingParams, PocketRef,
+    SurfaceNormal5Axis, SurfaceNormal5AxisParams,
+    Swarf5Axis, Swarf5AxisParams, Tapping, TappingParams, ThreadMilling, ThreadMillingParams,
+    ThreePlusTwo, ThreePlusTwoParams, ToolpathStrategy,
 };
-pub use tool::{starter_presets_for, Coolant, FeedSpeedPreset, Tool, ToolHolder, ToolShape};
+pub use tool::{
+    holder_collision, starter_presets_for, Coolant, FeedSpeedPreset, Tool, ToolHolder, ToolShape,
+};
 pub use toolpath::{MoveType, OperationType, Toolpath, ToolpathPoint};
+pub use verify::{has_errors, verify_job, Issue, IssueLevel};

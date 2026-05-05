@@ -24,6 +24,10 @@ pub struct ContourParallelParams {
     pub feed_rate: f64,
     /// Surface chord tolerance [mm].
     pub tolerance: f64,
+    /// Stock to leave on the part surface [mm]. The contour offset normal
+    /// is pushed outward by this amount so the cut stays clear of the part.
+    #[serde(default)]
+    pub stock_to_leave: f64,
 }
 
 impl Default for ContourParallelParams {
@@ -32,6 +36,7 @@ impl Default for ContourParallelParams {
             step_down: 0.5,
             feed_rate: 600.0,
             tolerance: 0.01,
+            stock_to_leave: 0.0,
         }
     }
 }
@@ -93,7 +98,9 @@ impl ToolpathStrategy for ContourParallel {
                         normal = -dir; // Fallback to ray direction
                     }
 
-                    let pos = hit_point.cast::<f64>() + normal * tool_r;
+                    // Tool-radius offset + stock-to-leave, both along the wall
+                    // normal so the contour stays clear of the part.
+                    let pos = hit_point.cast::<f64>() + normal * (tool_r + params.stock_to_leave.max(0.0));
                     pass_points.push(ToolpathPoint {
                         position: nalgebra::Point3::new(pos.x, pos.y, z),
                         orientation: nalgebra::Vector3::z_axis(),

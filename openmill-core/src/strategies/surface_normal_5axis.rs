@@ -45,6 +45,10 @@ pub struct SurfaceNormal5AxisParams {
     pub tolerance: f64,
     /// Scan pattern.
     pub pattern: DrivePattern,
+    /// Stock to leave on the part surface [mm]. Each contact point is
+    /// pushed outward along the surface normal by this amount.
+    #[serde(default)]
+    pub stock_to_leave: f64,
 }
 
 impl Default for SurfaceNormal5AxisParams {
@@ -56,6 +60,7 @@ impl Default for SurfaceNormal5AxisParams {
             feed_rate: 400.0,
             tolerance: 0.005,
             pattern: DrivePattern::Parallel,
+            stock_to_leave: 0.0,
         }
     }
 }
@@ -125,7 +130,7 @@ impl SurfaceNormal5Axis {
                     if normal.z < 0.0 { normal = -normal; }
                     
                     let orientation = self.apply_lead_tilt(normal, true, params);
-                    let pos = self.calculate_tool_pos(hit_point, normal, tool, tool_r);
+                    let pos = self.calculate_tool_pos_with_offset(hit_point, normal, tool, tool_r, params.stock_to_leave);
                     
                     pass_points.push(ToolpathPoint {
                         position: pos,
@@ -174,7 +179,7 @@ impl SurfaceNormal5Axis {
                 if normal.z < 0.0 { normal = -normal; }
                 
                 let orientation = self.apply_lead_tilt(normal, true, params);
-                let pos = self.calculate_tool_pos(hit_point, normal, tool, tool_r);
+                let pos = self.calculate_tool_pos_with_offset(hit_point, normal, tool, tool_r, params.stock_to_leave);
                 
                 pass_points.push(ToolpathPoint {
                     position: pos,
@@ -233,7 +238,7 @@ impl SurfaceNormal5Axis {
                     if normal.z < 0.0 { normal = -normal; }
 
                     let tool_orientation = self.apply_lead_tilt(normal, forward, params);
-                    let pos = self.calculate_tool_pos(hit_point, normal, tool, tool_r);
+                    let pos = self.calculate_tool_pos_with_offset(hit_point, normal, tool, tool_r, params.stock_to_leave);
 
                     pass_points.push(ToolpathPoint {
                         position: pos,
@@ -300,7 +305,7 @@ impl SurfaceNormal5Axis {
                     if normal.dot(&dir) < 0.0 { normal = -normal; }
                     
                     let tool_orientation = self.apply_lead_tilt(normal, forward, params);
-                    let pos = self.calculate_tool_pos(hit_point, normal, tool, tool_r);
+                    let pos = self.calculate_tool_pos_with_offset(hit_point, normal, tool, tool_r, params.stock_to_leave);
 
                     pass_points.push(ToolpathPoint {
                         position: pos,
@@ -350,15 +355,33 @@ impl SurfaceNormal5Axis {
         tool_orientation
     }
 
-    fn calculate_tool_pos(&self, hit_point: Point3<f32>, normal: Vector3<f64>, tool: &Tool, tool_r: f64) -> Point3<f64> {
+    fn calculate_tool_pos_with_offset(
+        &self,
+        hit_point: Point3<f32>,
+        normal: Vector3<f64>,
+        tool: &Tool,
+        tool_r: f64,
+        stock_to_leave: f64,
+    ) -> Point3<f64> {
+        let stock = stock_to_leave.max(0.0);
         if tool.shape.is_ball() {
+            // Ball mill: cutter centre sits at distance (radius + skin) along
+            // the surface normal — ball touches the part shifted by `skin`.
+            let r = tool_r + stock;
             Point3::new(
-                hit_point.x as f64 + normal.x * tool_r,
-                hit_point.y as f64 + normal.y * tool_r,
-                hit_point.z as f64 + normal.z * tool_r,
+                hit_point.x as f64 + normal.x * r,
+                hit_point.y as f64 + normal.y * r,
+                hit_point.z as f64 + normal.z * r,
             )
         } else {
-            Point3::new(hit_point.x as f64, hit_point.y as f64, hit_point.z as f64)
+            // Flat / non-ball mill: lift the tip along the surface normal by
+            // the stock-to-leave amount (no automatic radius offset — this
+            // mode assumes the user has compensated geometry).
+            Point3::new(
+                hit_point.x as f64 + normal.x * stock,
+                hit_point.y as f64 + normal.y * stock,
+                hit_point.z as f64 + normal.z * stock,
+            )
         }
     }
 

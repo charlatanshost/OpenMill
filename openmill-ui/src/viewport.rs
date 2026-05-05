@@ -148,6 +148,42 @@ impl OrbitCamera {
         mat4_mul(proj, view)
     }
 
+    /// Build a world-space ray from a 2D point inside the viewport rect.
+    /// `(rect_x, rect_y)` is the viewport size in pixels; `(px, py)` is the
+    /// click position relative to the rect's top-left corner.
+    /// Returns `(origin, direction)` with `direction` unit-length.
+    pub fn ray_from_screen(
+        &self,
+        px: f32, py: f32,
+        rect_w: f32, rect_h: f32,
+    ) -> (nalgebra::Point3<f32>, nalgebra::Vector3<f32>) {
+        let aspect = rect_w / rect_h.max(1.0);
+
+        // Pull the same VP matrix as the GPU sees.
+        let vp_arr = self.view_proj(aspect);
+        let vp = nalgebra::Matrix4::from_columns(&[
+            nalgebra::Vector4::new(vp_arr[0][0], vp_arr[0][1], vp_arr[0][2], vp_arr[0][3]),
+            nalgebra::Vector4::new(vp_arr[1][0], vp_arr[1][1], vp_arr[1][2], vp_arr[1][3]),
+            nalgebra::Vector4::new(vp_arr[2][0], vp_arr[2][1], vp_arr[2][2], vp_arr[2][3]),
+            nalgebra::Vector4::new(vp_arr[3][0], vp_arr[3][1], vp_arr[3][2], vp_arr[3][3]),
+        ]);
+        let inv = vp.try_inverse().unwrap_or_else(nalgebra::Matrix4::identity);
+
+        // Pixel → NDC. NDC y is flipped relative to screen y.
+        let nx = (px / rect_w) * 2.0 - 1.0;
+        let ny = -((py / rect_h) * 2.0 - 1.0);
+
+        // Unproject near (z = 0 in NDC) and far (z = 1).
+        let near_clip = nalgebra::Vector4::new(nx, ny, 0.0, 1.0);
+        let far_clip  = nalgebra::Vector4::new(nx, ny, 1.0, 1.0);
+        let near_w = inv * near_clip;
+        let far_w  = inv * far_clip;
+        let near = nalgebra::Point3::new(near_w.x / near_w.w, near_w.y / near_w.w, near_w.z / near_w.w);
+        let far  = nalgebra::Point3::new(far_w.x  / far_w.w,  far_w.y  / far_w.w,  far_w.z  / far_w.w);
+        let dir = (far - near).normalize();
+        (near, dir)
+    }
+
     /// Handle mouse drag and scroll for orbit/pan/zoom.
     pub fn handle_input(&mut self, response: &egui::Response, scroll: f32) {
         // Left drag: orbit
@@ -211,6 +247,11 @@ pub struct Viewport {
 
     stock_buffer: Option<wgpu::Buffer>,
     stock_count: u32,
+
+    /// Triangle-list buffer for the currently picked face cluster (yellow
+    /// highlight overlay). Always rendered on top.
+    pick_buffer: Option<wgpu::Buffer>,
+    pick_count: u32,
 
     tool_buffer: Option<wgpu::Buffer>,
     tool_count: u32,
@@ -427,6 +468,8 @@ impl Viewport {
             mesh_count: 0,
             stock_buffer: None,
             stock_count: 0,
+            pick_buffer: None,
+            pick_count: 0,
             tool_buffer: None,
             tool_count: 0,
             path_buffer: None,
@@ -811,6 +854,45 @@ impl Viewport {
         ));
     }
 
+    /// Upload triangles for the currently picked face cluster. The triangles
+    /// are rendered as a yellow opaque overlay on top of everything else so
+    /// the user can see exactly which faces they've selected. Pass an empty
+    /// slice (or call `clear_pick`) to remove the highlight.
+    pub fn upload_pick_triangles(
+        &mut self,
+        device: &wgpu::Device,
+        triangles: &[[nalgebra::Point3<f32>; 3]],
+    ) {
+        let mut v = Vec::with_capacity(triangles.len() * 3);
+        let color = [1.0, 0.85, 0.1]; // bright amber
+        for tri in triangles {
+            let p0 = tri[0]; let p1 = tri[1]; let p2 = tri[2];
+            let n = (p1 - p0).cross(&(p2 - p0));
+            let n_unit = if n.norm() > 1e-8 { n.normalize() } else { nalgebra::Vector3::z() };
+            let normal = [n_unit.x, n_unit.y, n_unit.z];
+            for p in [p0, p1, p2] {
+                v.push(Vertex { position: [p.x, p.y, p.z], normal, color });
+            }
+        }
+        self.pick_count = v.len() as u32;
+        if v.is_empty() {
+            self.pick_buffer = None;
+            return;
+        }
+        self.pick_buffer = Some(device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("pick_buffer"),
+                contents: bytemuck::cast_slice(&v),
+                usage: wgpu::BufferUsages::VERTEX,
+            },
+        ));
+    }
+
+    pub fn clear_pick(&mut self) {
+        self.pick_buffer = None;
+        self.pick_count = 0;
+    }
+
     pub fn upload_collisions(&mut self, device: &wgpu::Device, points: &[nalgebra::Point3<f32>]) {
         let mut v = Vec::new();
         let color = [1.0, 0.0, 0.0]; // Bright Red for collisions
@@ -960,6 +1042,14 @@ impl Viewport {
                 pass.set_pipeline(&self.line_pipeline);
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..self.tool_count, 0..1);
+            }
+
+            // Draw the picked-face highlight on top of the mesh / stock so
+            // the user always sees which face they've selected.
+            if let Some(ref buf) = self.pick_buffer {
+                pass.set_pipeline(&self.mesh_pipeline);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..self.pick_count, 0..1);
             }
 
             // Draw voxel volume (Simulation view only).

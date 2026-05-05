@@ -44,25 +44,62 @@ cargo run -p openmill-ui
 - Roughing strategies must use `model.stock_aabb()` for scan bounds, not `model.aabb`.
 
 ### Where to Extend
-- **New strategy:** implement `ToolpathStrategy` in `openmill-core/src/strategies/`, register it in `mod.rs`, add it to `STRATEGIES` in `openmill-ui/src/app.rs`, wire up the dispatch arm and a params editor in `show_strategy_params`.
+- **New strategy:** implement `ToolpathStrategy` in `openmill-core/src/strategies/`, register it in `mod.rs`, add it to `STRATEGIES` in `openmill-ui/src/app.rs`, wire up the dispatch arm and a params editor in `show_strategy_params`. If the strategy honours `stock_to_leave`, add a `pub stock_to_leave: f64` field with `#[serde(default)]` and the op-level value will be auto-injected at generate time.
 - **New post-processor:** implement `PostProcessor` in `openmill-post`, add it to `POST_PROCESSOR_NAMES` and `get_post()` in `openmill-post/src/lib.rs`. Follow the per-op emission contract documented on the `PostProcessor` trait.
+- **New feature detector:** add a free function in `openmill-core/src/feature.rs` that takes `&TriMesh` and returns `Vec<Feature>`. Re-export from `lib.rs`. Wire a button into `section_features` in `openmill-ui/src/app.rs`.
+- **New verifier check:** add a `fn check_*` to `openmill-core/src/verify.rs` and call it from `verify_job`. Use `Issue::err` for blocking issues and `Issue::warn` for advisories.
 
 ## 🗺️ Roadmap
 
-**Done**
-- [x] 4+1 indexed milling.
-- [x] G93 / G94 auto-mode selection per toolpath.
-- [x] Per-tool feed-and-speed presets, per-op coolant + custom G-code.
-- [x] Stock-aware roughing (3+2, 4+1, Adaptive Clearing, Contour Parallel).
-- [x] Plan / Simulation view split with translucent ghost-mesh collision overlay.
+### ✓ Done
+- 4+1 indexed milling.
+- G93 / G94 auto-mode selection per toolpath; inverse-time feed math near singularities.
+- Per-tool feed-and-speed presets, per-op coolant + custom G-code.
+- Stock-aware roughing (3+2, 4+1, Adaptive Clearing, Contour Parallel) and op-level `stock_to_leave` auto-injected into strategy params.
+- Plan / Simulation view split with translucent ghost-mesh X-ray overlay.
+- Full tool-body voxel carving with gradient-shaded surface normals.
+- Adaptive Clearing implemented as stock-aware raster (no longer panics).
+- Pocket Clearing strategy + auto pocket detection.
+- Tapping (rigid `feed = rpm × pitch`) and Thread Milling (helical) strategies.
+- Feature pipeline: auto-detect Holes / Pockets and 🎯 click-to-pick face mode with auto-classification.
+- Stock dimensions in mm or decimal inch, model position editor, position persisted to job file.
+- Job open/load round-trip (model + position + ops + features + tools + machine).
+- Tool-holder collision detection in sim.
+- Drag-reorder operations (⬆/⬇).
+- Pre-export verifier (axis limits, rotary range, undefined feeds, gouges, holder collisions); export auto-runs and refuses on errors.
+- Estimated machining time per op + job total.
 
-**Next up**
-- [ ] True trochoidal medial-axis paths in `AdaptiveClearing` (the current implementation is a stock-aware raster).
+### 🛠 In progress / Next up
+
+**Tier 2 — Important quality-of-life**
+- [ ] Lead-in / lead-out arcs for finishing.
+- [ ] Helical / ramp entry for plunges.
+- [ ] Setup / WCS management (multi-side jobs in one job file).
+- [ ] Fixture visualization + collision avoidance.
+- [ ] Material-removal stats in sim (volume + MRR).
+- [ ] Undo / Redo.
+
+**Tier 3 — Strategy / detection coverage**
+- [ ] Inclined / counter-bore / threaded hole detection.
+- [ ] Non-circular pocket detection (rectangle / polygon footprint).
+- [ ] Edge detection for chamfer-mill ops.
+- [ ] DXF / 2D profile import.
+- [ ] Probing strategy (G38.2 cycles).
+- [ ] Climb-only raster option (no zigzag).
+
+**Tier 4 — Polish**
+- [ ] Material library UI.
+- [ ] Tool import from Fusion / FreeCAD JSON.
+- [ ] Operation templates (save reusable patterns).
+- [ ] Spindle-load / chip-thinning warnings.
+- [ ] 5-axis tool-axis smoothing (B-spline filter for jerk reduction).
+- [ ] Toolpath edit (delete a single pass without regenerating).
+- [ ] Multi-toolpath ops (rough + semi-finish + finish in one op).
+
+**Strategy depth (parallel track)**
+- [ ] True trochoidal medial-axis paths in `AdaptiveClearing` (current is a stock-aware raster).
 - [ ] True heat-method geodesic solver for `GeodesicParallel` (currently uses Z-height as a distance proxy).
 - [ ] Mesh-based stock support (`StockDef::MeshFile`).
-- [ ] Tool-holder collision detection (currently only the cutter is checked).
-- [ ] Hole auto-detection from imported mesh (currently manual hole list in 5-Axis Drilling).
-- [ ] Job save/load (`*.omj`) — full round-trip of model + ops + tools + machine.
 - [ ] S-curve acceleration in post-processors.
 - [ ] Additional post-processors (Mach3/4, Centroid, Haas).
 

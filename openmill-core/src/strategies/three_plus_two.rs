@@ -31,6 +31,9 @@ pub struct ThreePlusTwoParams {
     pub step_over: f64,
     /// Cutting feed rate [mm/min].
     pub feed_rate: f64,
+    /// Stock to leave on the part surface [mm].
+    #[serde(default)]
+    pub stock_to_leave: f64,
 }
 
 impl Default for ThreePlusTwoParams {
@@ -41,6 +44,7 @@ impl Default for ThreePlusTwoParams {
             step_down: 1.0,
             step_over: 0.5,
             feed_rate: 700.0,
+            stock_to_leave: 0.0,
         }
     }
 }
@@ -166,7 +170,10 @@ impl ToolpathStrategy for ThreePlusTwo {
                     if let Some(toi) = model.mesh.cast_local_ray(&ray, (safe_lz - lz_bot) as f32, true) {
                         hit_lz = (safe_lz - toi as f64).max(lz_bot);
                     }
-                    
+                    // Honour stock-to-leave: hold cutting moves above the
+                    // part surface in the **local-Z** direction (the cutting
+                    // plane). Hard-coded mins of `lz` still apply.
+                    let hit_lz = hit_lz + params.stock_to_leave.max(0.0);
                     let target_lz = lz.max(hit_lz);
                     segment_points.push(Point3::new(clx, ly, target_lz));
                 }

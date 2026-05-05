@@ -19,6 +19,11 @@ pub struct Job {
     pub name: String,
     /// Path to the part mesh file (STL or 3MF), relative to the job file.
     pub model_path: Option<String>,
+    /// Translation applied to the imported mesh to place it in the work area.
+    /// Persisted so the part shows up in the same position when a saved job
+    /// is reopened. Defaults to zero for backward compatibility.
+    #[serde(default)]
+    pub model_position: [f64; 3],
     /// Stock definition.
     pub stock: StockDef,
     /// Machine configuration for this job.
@@ -103,6 +108,12 @@ pub struct Operation {
     /// or any controller-specific setup.
     #[serde(default)]
     pub gcode_command: String,
+    /// Stock to leave on the finished part [mm]. Roughing ops typically set
+    /// this to 0.2–0.5 mm so a finishing op can come back and skim to size.
+    /// At generate time the value is auto-injected into the strategy's
+    /// `stock_to_leave` parameter (when the strategy honours it).
+    #[serde(default)]
+    pub stock_to_leave: f64,
     /// Whether this operation is enabled.
     pub enabled: bool,
 }
@@ -138,6 +149,7 @@ impl Default for Job {
         Job {
             name: "Untitled Job".into(),
             model_path: None,
+            model_position: [0.0, 0.0, 0.0],
             stock: StockDef::default(),
             machine: default_trunnion_config(),
             tools: vec![

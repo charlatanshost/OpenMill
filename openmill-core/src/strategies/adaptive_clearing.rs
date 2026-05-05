@@ -31,6 +31,10 @@ pub struct AdaptiveClearingParams {
     pub step_down: f64,
     /// Cutting feed rate [mm/min].
     pub feed_rate: f64,
+    /// Stock to leave on the part surface [mm] — keeps cutting moves this
+    /// far above the actual mesh so a finishing op can skim down to size.
+    #[serde(default)]
+    pub stock_to_leave: f64,
 }
 
 impl Default for AdaptiveClearingParams {
@@ -39,6 +43,7 @@ impl Default for AdaptiveClearingParams {
             max_engagement_deg: 60.0,
             step_down: 2.0,
             feed_rate: 800.0,
+            stock_to_leave: 0.0,
         }
     }
 }
@@ -114,7 +119,10 @@ impl ToolpathStrategy for AdaptiveClearing {
                     if let Some(toi) = model.mesh.cast_local_ray(&ray, (safe_z - z_bot) as f32, true) {
                         part_top = (safe_z - toi as f64).max(z_bot);
                     }
-                    let target_z = z.max(part_top);
+                    // Hold cutting moves `stock_to_leave` mm above the mesh
+                    // surface so a finishing op can skim down to size.
+                    let part_top_with_skin = part_top + params.stock_to_leave.max(0.0);
+                    let target_z = z.max(part_top_with_skin);
                     row.push(Point3::new(x, y, target_z));
                 }
 
