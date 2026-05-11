@@ -224,6 +224,35 @@ impl OrbitCamera {
         let diag = (dx * dx + dy * dy + dz * dz).sqrt();
         self.distance = diag * 1.5;
     }
+
+    // ── Camera presets ────────────────────────────────────────────────────
+    //
+    // Standard machinist views. The azimuth/elevation values lock the
+    // camera to the principal planes; distance and target are left alone
+    // so the user keeps whatever framing they had after orbiting.
+
+    /// Top-down view (+Z toward camera). The default "WCS top" most
+    /// CAM software opens with.
+    pub fn view_top(&mut self) {
+        self.azimuth = -std::f32::consts::FRAC_PI_2;
+        self.elevation = std::f32::consts::FRAC_PI_2 - 0.001;
+    }
+    /// Looking along +Y toward the part — front elevation.
+    pub fn view_front(&mut self) {
+        self.azimuth = -std::f32::consts::FRAC_PI_2;
+        self.elevation = 0.0;
+    }
+    /// Looking along -X toward the part — right side.
+    pub fn view_right(&mut self) {
+        self.azimuth = 0.0;
+        self.elevation = 0.0;
+    }
+    /// Three-quarter isometric — the same starting orientation as the
+    /// default camera. Use this as "go back to a sensible angle".
+    pub fn view_iso(&mut self) {
+        self.azimuth = 0.8;
+        self.elevation = 0.5;
+    }
 }
 
 // ── Viewport renderer ───────────────────────────────────────────────────────
@@ -247,6 +276,11 @@ pub struct Viewport {
 
     stock_buffer: Option<wgpu::Buffer>,
     stock_count: u32,
+
+    /// Wireframe box representing the machine's linear travel envelope. Drawn
+    /// in a dim red so it reads as a hard limit, not a normal scene element.
+    envelope_buffer: Option<wgpu::Buffer>,
+    envelope_count: u32,
 
     /// Triangle-list buffer for the currently picked face cluster (yellow
     /// highlight overlay). Always rendered on top.
@@ -273,6 +307,11 @@ pub struct Viewport {
     voxel_compute_bg: Option<wgpu::BindGroup>,
     voxel_render_bg: Option<wgpu::BindGroup>,
     voxel_uniforms: crate::voxel::VoxelUniforms,
+    /// GPU marching-cubes extractor. Lazily created on the first stock
+    /// upload (it depends on the wgpu device). Renders a smooth
+    /// iso-surface mesh of the carved stock alongside (or in place of)
+    /// the voxel ray-march.
+    mc: Option<crate::marching_cubes::MarchingCubes>,
 }
 
 impl Viewport {
@@ -468,6 +507,8 @@ impl Viewport {
             mesh_count: 0,
             stock_buffer: None,
             stock_count: 0,
+            envelope_buffer: None,
+            envelope_count: 0,
             pick_buffer: None,
             pick_count: 0,
             tool_buffer: None,
@@ -494,7 +535,9 @@ impl Viewport {
                 tool_axis_start: [0.0, 0.0, 1.0, 0.0],
                 tool_axis_end:   [0.0, 0.0, 1.0, 0.0],
                 tool_params:     [0.0; 4],
+                op_info:         [0.0; 4],
             },
+            mc: None,
         }
     }
 
@@ -520,6 +563,45 @@ impl Viewport {
     }
 
     /// Upload stock geometry as a wireframe.
+    /// Build a wireframe box for the machine's linear travel limits. Drawn
+    /// in a dim red so it reads as a hard boundary distinct from the
+    /// orange stock outline.
+    pub fn upload_envelope(
+        &mut self,
+        device: &wgpu::Device,
+        limits: &openmill_core::AxisLimits,
+    ) {
+        let (xn, xp) = (limits.x.0 as f32, limits.x.1 as f32);
+        let (yn, yp) = (limits.y.0 as f32, limits.y.1 as f32);
+        let (zn, zp) = (limits.z.0 as f32, limits.z.1 as f32);
+        let color = [0.85, 0.25, 0.25]; // dim red
+        let zero_n = [0.0; 3];
+        let p = [
+            [xn, yn, zn], [xp, yn, zn], [xp, yp, zn], [xn, yp, zn],
+            [xn, yn, zp], [xp, yn, zp], [xp, yp, zp], [xn, yp, zp],
+        ];
+        let mut v: Vec<Vertex> = Vec::with_capacity(24);
+        let mut line = |a: [f32; 3], b: [f32; 3]| {
+            v.push(Vertex { position: a, normal: zero_n, color });
+            v.push(Vertex { position: b, normal: zero_n, color });
+        };
+        // bottom rectangle
+        line(p[0], p[1]); line(p[1], p[2]); line(p[2], p[3]); line(p[3], p[0]);
+        // top rectangle
+        line(p[4], p[5]); line(p[5], p[6]); line(p[6], p[7]); line(p[7], p[4]);
+        // verticals
+        line(p[0], p[4]); line(p[1], p[5]); line(p[2], p[6]); line(p[3], p[7]);
+
+        self.envelope_count = v.len() as u32;
+        self.envelope_buffer = Some(device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("envelope_buffer"),
+                contents: bytemuck::cast_slice(&v),
+                usage: wgpu::BufferUsages::VERTEX,
+            },
+        ));
+    }
+
     pub fn upload_stock(
         &mut self,
         device: &wgpu::Device,
@@ -605,7 +687,12 @@ impl Viewport {
         ));
 
         // Initialize Voxel Volume
-        let res = [128, 128, 128]; // Lower resolution for stability first
+        // 256³ × 4 bytes = 64 MB. ~4× the surface detail vs 128³ and well
+        // within every modern GPU's storage texture budget. The naive
+        // full-volume compute dispatch still keeps up at this size for
+        // typical stocks; if it ever doesn't, the next move is a
+        // bounding-box-clipped dispatch.
+        let res = [256, 256, 256];
         let voxel_volume = crate::voxel::VoxelVolume::new(device, res, &self.bind_group_layout, self.target_format);
         
         let stock_min = match stock {
@@ -664,6 +751,14 @@ impl Viewport {
                     binding: 1,
                     resource: voxel_volume.uniform_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&voxel_volume.sdf_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&voxel_volume.sdf_sampler),
+                },
             ],
         }));
         
@@ -678,13 +773,105 @@ impl Viewport {
             tool_axis_start: [0.0, 0.0, 1.0, 0.0],
             tool_axis_end:   [0.0, 0.0, 1.0, 0.0],
             tool_params:     [0.0; 4],
+            op_info:         [0.0; 4],
         };
         self.voxel_volume = Some(voxel_volume);
+
+        // The marching-cubes extractor is built lazily — see
+        // `extract_iso_surface` — so model import only pays for it
+        // when the user actually toggles Smooth on. If a stock was
+        // previously bound, drop its bind group; the new voxel
+        // texture will get re-bound on the next extraction request.
+        if let Some(mc) = self.mc.as_mut() {
+            mc.bind_group = None;
+            mc.has_geometry = false;
+        }
     }
 
-    pub fn reset_voxel(&self, queue: &wgpu::Queue) {
+    pub fn reset_voxel(&mut self, queue: &wgpu::Queue) {
         if let Some(ref vol) = self.voxel_volume {
             vol.reset(queue);
+        }
+        // After a stock reset the cached iso-surface no longer
+        // describes the new voxel state.
+        if let Some(mc) = self.mc.as_mut() {
+            mc.has_geometry = false;
+        }
+    }
+
+    /// Re-extract the iso-surface mesh from the current voxel state.
+    /// Builds the MC pipeline + buffers on first call so unimported /
+    /// non-Smooth sessions never allocate it. Cheap on 128³ (~few ms
+    /// per dispatch); 256³ may run 15–25 ms on a typical desktop GPU.
+    pub fn extract_iso_surface(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let Some(vol) = self.voxel_volume.as_ref() else { return };
+        if self.mc.is_none() {
+            self.mc = Some(crate::marching_cubes::MarchingCubes::new(device));
+        }
+        let mc = self.mc.as_mut().expect("mc just initialised");
+        if mc.bind_group.is_none() {
+            mc.bind_voxel(device, &vol.view, &vol.uniform_buffer);
+        }
+        mc.extract(device, queue, vol.resolution);
+    }
+
+    #[allow(dead_code)]
+    pub fn iso_surface_ready(&self) -> bool {
+        self.mc.as_ref().map(|m| m.has_geometry).unwrap_or(false)
+    }
+
+    /// Replace the SDF texture sampled by Verify mode. The render bind
+    /// group is rebuilt to point at the new texture view.
+    pub fn upload_sdf(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        data: &[f32],
+        resolution: [u32; 3],
+    ) {
+        let Some(vol) = self.voxel_volume.as_mut() else { return };
+        vol.upload_sdf(device, queue, data, resolution);
+        // Rebuild the render bind group so the SDF view in slot 2 points
+        // at the new texture rather than the placeholder.
+        self.voxel_render_bg = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("voxel_render_bg"),
+            layout: &vol.render_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&vol.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: vol.uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&vol.sdf_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&vol.sdf_sampler),
+                },
+            ],
+        }));
+    }
+
+    /// Stamp the verify-related fields of `op_info` into the voxel uniform
+    /// buffer. Call once per frame from the app's update loop so the
+    /// shader sees the user's current toggle state and tolerance choice.
+    pub fn set_verify_uniforms(
+        &mut self,
+        queue: &wgpu::Queue,
+        verify_mode: bool,
+        tolerance_mm: f32,
+    ) {
+        // op_info: [op_id, verify_mode, tolerance_mm, reserved]
+        // op_id (x) belongs to the most recent carve and is preserved.
+        self.voxel_uniforms.op_info[1] = if verify_mode { 1.0 } else { 0.0 };
+        self.voxel_uniforms.op_info[2] = tolerance_mm;
+        if let Some(ref vol) = self.voxel_volume {
+            queue.write_buffer(&vol.uniform_buffer, 0, bytemuck::cast_slice(&[self.voxel_uniforms]));
         }
     }
 
@@ -695,6 +882,7 @@ impl Viewport {
         start: &nalgebra::Isometry3<f32>,
         end: &nalgebra::Isometry3<f32>,
         tool: &openmill_core::Tool,
+        op_id: u32,
     ) {
         let Some(ref vol) = self.voxel_volume else { return };
         let Some(ref bg) = self.voxel_compute_bg else { return };
@@ -723,6 +911,10 @@ impl Viewport {
             0.0,
             0.0,
         ];
+        // Stamp this carve with the op's id so the surface picks up the
+        // right palette entry. Stored as f32 — the shader rounds back to
+        // u32 before use.
+        self.voxel_uniforms.op_info = [op_id as f32, 0.0, 0.0, 0.0];
 
         queue.write_buffer(&vol.uniform_buffer, 0, bytemuck::cast_slice(&[self.voxel_uniforms]));
 
@@ -742,7 +934,15 @@ impl Viewport {
         queue.submit(std::iter::once(encoder.finish()));
     }
 
-    /// Upload tool wireframe for simulation at a specific pose.
+    /// Upload a **solid-shaded** tool + holder mesh for the current pose.
+    ///
+    /// Emits a triangle-list with per-vertex normals so the lit mesh
+    /// pipeline (Lambertian via [`fs_lit`]) renders it like Fusion's
+    /// rendered tool — flutes in cyan-ish steel, shank/holder in darker
+    /// graphite. The cutter geometry is approximated per [`ToolShape`]
+    /// (ball-end uses a UV-sphere hemisphere, drill uses a cone tip, etc.);
+    /// every variant falls back to a flat-end cylinder if no specialised
+    /// path matches.
     pub fn upload_tool(
         &mut self,
         device: &wgpu::Device,
@@ -757,41 +957,22 @@ impl Viewport {
         let pose = pose.unwrap();
         let tool = tool.unwrap();
 
-        let mut v = Vec::new();
-        let color = [0.2, 0.8, 1.0]; // Light blue wireframe for tool
-        let zero_n = [0.0; 3];
+        let mut v: Vec<Vertex> = Vec::new();
+        let cutter_color  = [0.78, 0.86, 0.95]; // brushed steel / cobalt
+        let shank_color   = [0.42, 0.44, 0.50]; // graphite shank
+        let holder_color  = [0.30, 0.31, 0.36]; // collet / holder body
 
-        let add_line = |v: &mut Vec<Vertex>, p1: nalgebra::Point3<f32>, p2: nalgebra::Point3<f32>| {
-            // Transform points by pose
-            let tp1 = pose * p1;
-            let tp2 = pose * p2;
-            v.push(Vertex { position: [tp1.x, tp1.y, tp1.z], normal: zero_n, color });
-            v.push(Vertex { position: [tp2.x, tp2.y, tp2.z], normal: zero_n, color });
-        };
+        build_tool_mesh(&mut v, tool, cutter_color, shank_color, holder_color);
 
-        // Draw a simple cylinder
-        let r = tool.shape.diameter() as f32 / 2.0;
-        let h = tool.overall_length as f32;
-        let segments = 16;
-        let mut prev_pt = nalgebra::Point3::new(r, 0.0, 0.0);
-        
-        for i in 1..=segments {
-            let angle = (i as f32 / segments as f32) * std::f32::consts::TAU;
-            let x = r * angle.cos();
-            let y = r * angle.sin();
-            let pt = nalgebra::Point3::new(x, y, 0.0);
-            let pt_top = nalgebra::Point3::new(x, y, h);
-            let prev_top = nalgebra::Point3::new(prev_pt.x, prev_pt.y, h);
-            
-            // Bottom circle
-            add_line(&mut v, prev_pt, pt);
-            // Top circle
-            add_line(&mut v, prev_top, pt_top);
-            // Vertical lines
-            if i % 4 == 0 {
-                add_line(&mut v, pt, pt_top);
-            }
-            prev_pt = pt;
+        // Transform every vertex by the pose. Doing it CPU-side keeps the
+        // mesh pipeline shader unchanged — no per-object model matrix.
+        for vert in &mut v {
+            let p = nalgebra::Point3::new(vert.position[0], vert.position[1], vert.position[2]);
+            let n = nalgebra::Vector3::new(vert.normal[0], vert.normal[1], vert.normal[2]);
+            let tp = pose * p;
+            let tn = pose.rotation * n;
+            vert.position = [tp.x, tp.y, tp.z];
+            vert.normal = [tn.x, tn.y, tn.z];
         }
 
         self.tool_count = v.len() as u32;
@@ -808,33 +989,79 @@ impl Viewport {
         ));
     }
 
-    pub fn upload_toolpath(&mut self, device: &wgpu::Device, paths: &[openmill_core::Toolpath]) {
+    /// Upload toolpath geometry for line-strip rendering.
+    ///
+    /// Each segment is colored by its `MoveType`. When `stock_aabb` is
+    /// supplied, cutting segments whose endpoints sit outside the stock
+    /// envelope (above the top face or beyond the side faces by more than
+    /// the tool radius) are flagged as **air cuts** and dimmed — the tool
+    /// is moving but not engaged with material. This is purely geometric
+    /// (no voxel sampling) so prior material removal doesn't influence the
+    /// classification, but it's enough to catch the common case of
+    /// over-shooting raster patterns and dwell-above-stock segments.
+    pub fn upload_toolpath(
+        &mut self,
+        device: &wgpu::Device,
+        paths: &[openmill_core::Toolpath],
+        stock_aabb: Option<&parry3d::bounding_volume::Aabb>,
+        tool_radius_mm: f32,
+    ) {
         let mut v = Vec::new();
         let zero_n = [0.0; 3];
+        let r = tool_radius_mm.max(0.0);
+
+        // Test whether a tool-tip point lies within (or just outside) the
+        // stock envelope. Tip above the stock top counts as definitely
+        // not cutting; tip outside the XY footprint by more than the tool
+        // radius likewise.
+        let in_stock = |p: &nalgebra::Point3<f64>| -> bool {
+            let Some(aabb) = stock_aabb else { return true };
+            let px = p.x as f32;
+            let py = p.y as f32;
+            let pz = p.z as f32;
+            pz <= aabb.maxs.z + 1e-3
+                && px >= aabb.mins.x - r
+                && px <= aabb.maxs.x + r
+                && py >= aabb.mins.y - r
+                && py <= aabb.maxs.y + r
+        };
 
         for tp in paths {
             for i in 0..tp.points.len().saturating_sub(1) {
                 let p1 = tp.points[i].position;
                 let p2 = tp.points[i + 1].position;
-                let mtype = tp.points[i+1].move_type;
+                let mtype = tp.points[i + 1].move_type;
+                let is_cut = matches!(
+                    mtype,
+                    openmill_core::toolpath::MoveType::Linear
+                        | openmill_core::toolpath::MoveType::LeadIn
+                        | openmill_core::toolpath::MoveType::LeadOut
+                );
+                let air_cut = is_cut && !in_stock(&p1) && !in_stock(&p2);
 
-                // Color based on move type
-                let color = match mtype {
-                    openmill_core::toolpath::MoveType::Rapid => [1.0, 0.2, 0.2],    // Red
-                    openmill_core::toolpath::MoveType::Linear => [0.2, 0.8, 1.0],   // Cyan
-                    openmill_core::toolpath::MoveType::LeadIn | openmill_core::toolpath::MoveType::LeadOut => [0.2, 1.0, 0.2], // Green
-                    openmill_core::toolpath::MoveType::Retract => [1.0, 1.0, 0.2], // Yellow
+                // Base color by move type, then desaturate when the
+                // segment is "air cutting" so the user instantly sees
+                // wasted motion.
+                let mut color = match mtype {
+                    openmill_core::toolpath::MoveType::Rapid => [1.0, 0.2, 0.2],
+                    openmill_core::toolpath::MoveType::Linear => [0.2, 0.8, 1.0],
+                    openmill_core::toolpath::MoveType::LeadIn
+                    | openmill_core::toolpath::MoveType::LeadOut => [0.2, 1.0, 0.2],
+                    openmill_core::toolpath::MoveType::Retract => [1.0, 1.0, 0.2],
                 };
+                if air_cut {
+                    for c in &mut color { *c *= 0.35; }
+                }
 
-                v.push(Vertex { 
-                    position: [p1.x as f32, p1.y as f32, p1.z as f32], 
-                    normal: zero_n, 
-                    color 
+                v.push(Vertex {
+                    position: [p1.x as f32, p1.y as f32, p1.z as f32],
+                    normal: zero_n,
+                    color,
                 });
-                v.push(Vertex { 
-                    position: [p2.x as f32, p2.y as f32, p2.z as f32], 
-                    normal: zero_n, 
-                    color 
+                v.push(Vertex {
+                    position: [p2.x as f32, p2.y as f32, p2.z as f32],
+                    normal: zero_n,
+                    color,
                 });
             }
         }
@@ -939,6 +1166,8 @@ impl Viewport {
         show_full_path: bool,
         show_mesh: bool,
         show_voxel: bool,
+        show_envelope: bool,
+        show_iso_surface: bool,
     ) {
         let device = &render_state.device;
         let queue = &render_state.queue;
@@ -1037,9 +1266,18 @@ impl Viewport {
                 pass.draw(0..self.stock_count, 0..1);
             }
 
-            // Draw tool wireframe.
+            // Draw machine travel envelope when requested.
+            if show_envelope {
+                if let Some(ref buf) = self.envelope_buffer {
+                    pass.set_pipeline(&self.line_pipeline);
+                    pass.set_vertex_buffer(0, buf.slice(..));
+                    pass.draw(0..self.envelope_count, 0..1);
+                }
+            }
+
+            // Draw solid-shaded tool + holder (triangle list, lit).
             if let Some(ref buf) = self.tool_buffer {
-                pass.set_pipeline(&self.line_pipeline);
+                pass.set_pipeline(&self.mesh_pipeline);
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..self.tool_count, 0..1);
             }
@@ -1052,16 +1290,38 @@ impl Viewport {
                 pass.draw(0..self.pick_count, 0..1);
             }
 
-            // Draw voxel volume (Simulation view only).
+            // Draw simulated stock — Simulation view only. We pick one
+            // of two paths:
+            //   - `show_iso_surface`: marching-cubes mesh through the
+            //     lit pipeline. Pro-CAM look (Fusion / FreeCAD).
+            //   - else: ray-march the voxel volume. Cheaper to update
+            //     during play and works with Verify mode's SDF heatmap.
             if show_voxel {
-                if let (Some(ref vol), Some(ref bg)) = (&self.voxel_volume, &self.voxel_render_bg) {
-                    pass.set_pipeline(&vol.render_pipeline);
-                    pass.set_bind_group(0, bg, &[]);
-                    pass.set_bind_group(1, &self.bind_group, &[]);
-                    pass.draw(0..36, 0..1);
-
-                    // Restore standard bind group for subsequent draw calls (toolpath, etc)
-                    pass.set_bind_group(0, &self.bind_group, &[]);
+                let drew_iso = if show_iso_surface {
+                    if let Some(mc) = self.mc.as_ref() {
+                        if mc.has_geometry {
+                            pass.set_pipeline(&self.mesh_pipeline);
+                            pass.set_bind_group(0, &self.bind_group, &[]);
+                            mc.draw(&mut pass);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !drew_iso {
+                    if let (Some(ref vol), Some(ref bg)) = (&self.voxel_volume, &self.voxel_render_bg) {
+                        pass.set_pipeline(&vol.render_pipeline);
+                        pass.set_bind_group(0, bg, &[]);
+                        pass.set_bind_group(1, &self.bind_group, &[]);
+                        pass.draw(0..36, 0..1);
+                        // Restore standard bind group for subsequent draw calls.
+                        pass.set_bind_group(0, &self.bind_group, &[]);
+                    }
                 }
 
                 // Ghost-mesh overlay: drawn AFTER the voxel so the part
@@ -1269,4 +1529,297 @@ fn normalize3(v: [f32; 3]) -> [f32; 3] {
     } else {
         [v[0] / len, v[1] / len, v[2] / len]
     }
+}
+
+// ── Solid tool / holder mesh builder ────────────────────────────────────────
+//
+// Emits a triangle list (CCW from outside) with per-vertex normals so the
+// existing lit mesh pipeline shades the tool like a rendered Fusion tool.
+// The whole mesh sits in **local tool space**: tip at the origin, +Z along
+// the body toward the shank. Callers transform every vertex by the active
+// tool pose before uploading.
+
+const TOOL_SEGMENTS: usize = 32;
+
+fn build_tool_mesh(
+    v: &mut Vec<Vertex>,
+    tool: &openmill_core::Tool,
+    cutter_color: [f32; 3],
+    shank_color: [f32; 3],
+    holder_color: [f32; 3],
+) {
+    use openmill_core::ToolShape::*;
+    let fl = tool.shape.flute_length() as f32;
+    let ol = tool.overall_length.max(tool.shape.flute_length()) as f32;
+    let shank_r = (tool.shank_diameter * 0.5).max(0.1) as f32;
+    let cutter_r = (tool.shape.diameter() * 0.5).max(0.1) as f32;
+
+    // ── Cutter body ─────────────────────────────────────────────────────
+    match &tool.shape {
+        FlatEnd { .. } => {
+            cylinder_side(v, 0.0, fl, cutter_r, cutter_r, cutter_color);
+            disc_cap(v, 0.0, cutter_r, [0.0, 0.0, -1.0], cutter_color);
+        }
+        BallEnd { .. } => {
+            let r = cutter_r;
+            cylinder_side(v, r, fl, r, r, cutter_color);
+            hemisphere(v, r, r, cutter_color);
+        }
+        BullNose { corner_radius, .. } => {
+            let cr = (*corner_radius as f32).min(cutter_r).max(0.0);
+            cylinder_side(v, cr, fl, cutter_r, cutter_r, cutter_color);
+            torus_quarter(v, cr, cutter_r, cutter_color);
+        }
+        Drill { point_angle, .. } => {
+            let half = (*point_angle as f32 * 0.5).to_radians();
+            let tip_h = (cutter_r / half.tan().max(0.05)).min(fl);
+            cylinder_side(v, tip_h, fl, cutter_r, cutter_r, cutter_color);
+            cone_tip(v, 0.0, tip_h, cutter_r, cutter_color);
+        }
+        ChamferMill { tip_diameter, diameter, .. } => {
+            let r_tip = (*tip_diameter as f32 * 0.5).max(0.05);
+            let r_maj = (*diameter as f32 * 0.5).max(r_tip);
+            // Tapered cone from tip up to fl-height.
+            cone_frustum_side(v, 0.0, fl, r_tip, r_maj, cutter_color);
+            disc_cap(v, 0.0, r_tip, [0.0, 0.0, -1.0], cutter_color);
+        }
+        TaperedMill { tip_diameter, .. } => {
+            let r_tip = (*tip_diameter as f32 * 0.5).max(0.05);
+            cone_frustum_side(v, 0.0, fl, r_tip, cutter_r, cutter_color);
+            disc_cap(v, 0.0, r_tip, [0.0, 0.0, -1.0], cutter_color);
+        }
+        Lollipop { diameter, neck_diameter, .. } => {
+            let r_head = (*diameter as f32 * 0.5).max(0.1);
+            let r_neck = (*neck_diameter as f32 * 0.5).max(0.05);
+            // Sphere head centered at z = r_head, neck above.
+            sphere(v, r_head, r_head, cutter_color);
+            cylinder_side(v, r_head, fl, r_neck, r_neck, shank_color);
+        }
+        _ => {
+            // Generic fallback: flat-end cylinder for dovetail / thread mill.
+            cylinder_side(v, 0.0, fl, cutter_r, cutter_r, cutter_color);
+            disc_cap(v, 0.0, cutter_r, [0.0, 0.0, -1.0], cutter_color);
+        }
+    }
+
+    // ── Shank above the flutes ──────────────────────────────────────────
+    if ol > fl + 0.1 {
+        cylinder_side(v, fl, ol, shank_r, shank_r, shank_color);
+        disc_cap(v, ol, shank_r, [0.0, 0.0, 1.0], shank_color);
+    }
+
+    // ── Optional holder profile (axisymmetric (z, r) sweep). Sits above
+    // the shank end so the user sees collision danger up to the spindle.
+    if let Some(holder) = &tool.holder {
+        holder_swept(v, &holder.profile, ol, holder_color);
+    }
+}
+
+/// Side wall of a cylinder/frustum from `z0` to `z1`, radius `r0` at `z0`
+/// and `r1` at `z1`. Normals point radially outward.
+fn cylinder_side(v: &mut Vec<Vertex>, z0: f32, z1: f32, r0: f32, r1: f32, color: [f32; 3]) {
+    if z1 <= z0 + 1e-6 { return; }
+    let n_seg = TOOL_SEGMENTS;
+    for i in 0..n_seg {
+        let a0 = (i     as f32 / n_seg as f32) * std::f32::consts::TAU;
+        let a1 = ((i+1) as f32 / n_seg as f32) * std::f32::consts::TAU;
+        let (c0, s0) = (a0.cos(), a0.sin());
+        let (c1, s1) = (a1.cos(), a1.sin());
+        let p00 = [r0 * c0, r0 * s0, z0];
+        let p10 = [r0 * c1, r0 * s1, z0];
+        let p01 = [r1 * c0, r1 * s0, z1];
+        let p11 = [r1 * c1, r1 * s1, z1];
+        // Outward radial normals; for tapered frustums add a vertical
+        // component so the lighting reads the slope. Keep it simple — use
+        // the midpoint surface normal for the whole quad.
+        let dz = z1 - z0;
+        let dr = r1 - r0;
+        let slope_len = (dz * dz + dr * dr).sqrt().max(1e-6);
+        let nz = -dr / slope_len;
+        let nrad = dz / slope_len;
+        let n0 = normalize3([c0 * nrad, s0 * nrad, nz]);
+        let n1 = normalize3([c1 * nrad, s1 * nrad, nz]);
+        push_tri(v, p00, p10, p11, n0, n1, n1, color);
+        push_tri(v, p00, p11, p01, n0, n1, n0, color);
+    }
+}
+
+fn cone_frustum_side(v: &mut Vec<Vertex>, z0: f32, z1: f32, r0: f32, r1: f32, color: [f32; 3]) {
+    cylinder_side(v, z0, z1, r0, r1, color);
+}
+
+/// Solid cone tip from `z_tip` (point) up to `z_base` (radius `r_base`).
+fn cone_tip(v: &mut Vec<Vertex>, z_tip: f32, z_base: f32, r_base: f32, color: [f32; 3]) {
+    let n_seg = TOOL_SEGMENTS;
+    let tip = [0.0, 0.0, z_tip];
+    let dz = z_base - z_tip;
+    let slope = (dz * dz + r_base * r_base).sqrt().max(1e-6);
+    for i in 0..n_seg {
+        let a0 = (i     as f32 / n_seg as f32) * std::f32::consts::TAU;
+        let a1 = ((i+1) as f32 / n_seg as f32) * std::f32::consts::TAU;
+        let (c0, s0) = (a0.cos(), a0.sin());
+        let (c1, s1) = (a1.cos(), a1.sin());
+        let p0 = [r_base * c0, r_base * s0, z_base];
+        let p1 = [r_base * c1, r_base * s1, z_base];
+        let n_tip = normalize3([(c0 + c1) * 0.5 * dz / slope, (s0 + s1) * 0.5 * dz / slope, r_base / slope]);
+        let n0   = normalize3([c0 * dz / slope, s0 * dz / slope, r_base / slope]);
+        let n1   = normalize3([c1 * dz / slope, s1 * dz / slope, r_base / slope]);
+        push_tri(v, tip, p0, p1, n_tip, n0, n1, color);
+    }
+}
+
+/// Tip-down hemisphere of radius `r` centred at `z_center`. Used for
+/// ball-end cutters; bottom half (z ≤ z_center) faces outward / downward.
+fn hemisphere(v: &mut Vec<Vertex>, z_center: f32, r: f32, color: [f32; 3]) {
+    let n_seg = TOOL_SEGMENTS;
+    let n_lat = TOOL_SEGMENTS / 2;
+    for j in 0..n_lat {
+        let t0 = j as f32 / n_lat as f32; // 0..1 from bottom to equator
+        let t1 = (j + 1) as f32 / n_lat as f32;
+        // Latitude angle measured from the south pole (tip) upward.
+        let p0 = (t0 * std::f32::consts::FRAC_PI_2).sin();
+        let p1 = (t1 * std::f32::consts::FRAC_PI_2).sin();
+        let z0 = z_center - r * (1.0 - t0 * std::f32::consts::FRAC_PI_2).cos().abs(); // simpler form below
+        // Recompute using spherical lat angle for accuracy:
+        let lat0 = t0 * std::f32::consts::FRAC_PI_2 + std::f32::consts::FRAC_PI_2; // pi/2..pi
+        let lat1 = t1 * std::f32::consts::FRAC_PI_2 + std::f32::consts::FRAC_PI_2;
+        let _ = z0; let _ = p0; let _ = p1;
+        let r0 = r * lat0.sin();
+        let r1 = r * lat1.sin();
+        let z0 = z_center + r * lat0.cos(); // cos is negative in this range → below center
+        let z1 = z_center + r * lat1.cos();
+        for i in 0..n_seg {
+            let a0 = (i     as f32 / n_seg as f32) * std::f32::consts::TAU;
+            let a1 = ((i+1) as f32 / n_seg as f32) * std::f32::consts::TAU;
+            let (c0, s0) = (a0.cos(), a0.sin());
+            let (c1, s1) = (a1.cos(), a1.sin());
+            let p00 = [r0 * c0, r0 * s0, z0];
+            let p10 = [r0 * c1, r0 * s1, z0];
+            let p01 = [r1 * c0, r1 * s0, z1];
+            let p11 = [r1 * c1, r1 * s1, z1];
+            let n00 = normalize3([p00[0], p00[1], p00[2] - z_center]);
+            let n10 = normalize3([p10[0], p10[1], p10[2] - z_center]);
+            let n01 = normalize3([p01[0], p01[1], p01[2] - z_center]);
+            let n11 = normalize3([p11[0], p11[1], p11[2] - z_center]);
+            push_tri(v, p00, p10, p11, n00, n10, n11, color);
+            push_tri(v, p00, p11, p01, n00, n11, n01, color);
+        }
+    }
+}
+
+/// Full sphere of radius `r` centred at `z_center` — used for lollipop heads.
+fn sphere(v: &mut Vec<Vertex>, z_center: f32, r: f32, color: [f32; 3]) {
+    let n_seg = TOOL_SEGMENTS;
+    let n_lat = TOOL_SEGMENTS / 2;
+    for j in 0..n_lat {
+        let lat0 = (j as f32 / n_lat as f32) * std::f32::consts::PI;
+        let lat1 = ((j + 1) as f32 / n_lat as f32) * std::f32::consts::PI;
+        let r0 = r * lat0.sin();
+        let r1 = r * lat1.sin();
+        let z0 = z_center + r * lat0.cos();
+        let z1 = z_center + r * lat1.cos();
+        for i in 0..n_seg {
+            let a0 = (i     as f32 / n_seg as f32) * std::f32::consts::TAU;
+            let a1 = ((i+1) as f32 / n_seg as f32) * std::f32::consts::TAU;
+            let (c0, s0) = (a0.cos(), a0.sin());
+            let (c1, s1) = (a1.cos(), a1.sin());
+            let p00 = [r0 * c0, r0 * s0, z0];
+            let p10 = [r0 * c1, r0 * s1, z0];
+            let p01 = [r1 * c0, r1 * s0, z1];
+            let p11 = [r1 * c1, r1 * s1, z1];
+            let n00 = normalize3([p00[0], p00[1], p00[2] - z_center]);
+            let n10 = normalize3([p10[0], p10[1], p10[2] - z_center]);
+            let n01 = normalize3([p01[0], p01[1], p01[2] - z_center]);
+            let n11 = normalize3([p11[0], p11[1], p11[2] - z_center]);
+            push_tri(v, p00, p10, p11, n00, n10, n11, color);
+            push_tri(v, p00, p11, p01, n00, n11, n01, color);
+        }
+    }
+}
+
+/// Quarter-torus filling the corner radius on a bull-nose cutter. Centre
+/// of the tube ring lies on a circle of radius `cutter_r - cr` at z = cr.
+fn torus_quarter(v: &mut Vec<Vertex>, cr: f32, cutter_r: f32, color: [f32; 3]) {
+    if cr <= 1e-6 { return; }
+    let n_seg = TOOL_SEGMENTS;
+    let n_tube = (TOOL_SEGMENTS / 4).max(4);
+    let ring_r = (cutter_r - cr).max(0.0);
+    for j in 0..n_tube {
+        // Tube angle: 0 = bottom of corner (z=0, r=cutter_r-cr... no, r=cutter_r when below center)
+        // We want sweep from theta=-pi/2 (pointing -Z, tube point at z=0)
+        // up to theta=0 (pointing +X, tube point at z=cr).
+        let t0 = j     as f32 / n_tube as f32;
+        let t1 = (j+1) as f32 / n_tube as f32;
+        let th0 = -std::f32::consts::FRAC_PI_2 + t0 * std::f32::consts::FRAC_PI_2;
+        let th1 = -std::f32::consts::FRAC_PI_2 + t1 * std::f32::consts::FRAC_PI_2;
+        let cr0_z = cr + cr * th0.sin();
+        let cr1_z = cr + cr * th1.sin();
+        let cr0_r = ring_r + cr * th0.cos();
+        let cr1_r = ring_r + cr * th1.cos();
+        for i in 0..n_seg {
+            let a0 = (i     as f32 / n_seg as f32) * std::f32::consts::TAU;
+            let a1 = ((i+1) as f32 / n_seg as f32) * std::f32::consts::TAU;
+            let (c0, s0) = (a0.cos(), a0.sin());
+            let (c1, s1) = (a1.cos(), a1.sin());
+            let p00 = [cr0_r * c0, cr0_r * s0, cr0_z];
+            let p10 = [cr0_r * c1, cr0_r * s1, cr0_z];
+            let p01 = [cr1_r * c0, cr1_r * s0, cr1_z];
+            let p11 = [cr1_r * c1, cr1_r * s1, cr1_z];
+            // Outward normal: from ring centre at (ring_r*c, ring_r*s, cr)
+            let ring_c0 = [ring_r * c0, ring_r * s0, cr];
+            let ring_c1 = [ring_r * c1, ring_r * s1, cr];
+            let n00 = normalize3(sub3(p00, ring_c0));
+            let n10 = normalize3(sub3(p10, ring_c1));
+            let n01 = normalize3(sub3(p01, ring_c0));
+            let n11 = normalize3(sub3(p11, ring_c1));
+            push_tri(v, p00, p10, p11, n00, n10, n11, color);
+            push_tri(v, p00, p11, p01, n00, n11, n01, color);
+        }
+    }
+}
+
+/// Flat disc cap at height `z`, radius `r`. `n_dir` is `[0,0,-1]` for the
+/// bottom face (cutter tip) or `[0,0,1]` for the top of the shank.
+fn disc_cap(v: &mut Vec<Vertex>, z: f32, r: f32, n_dir: [f32; 3], color: [f32; 3]) {
+    if r <= 1e-6 { return; }
+    let n_seg = TOOL_SEGMENTS;
+    let centre = [0.0, 0.0, z];
+    let outward = n_dir[2];
+    for i in 0..n_seg {
+        let a0 = (i     as f32 / n_seg as f32) * std::f32::consts::TAU;
+        let a1 = ((i+1) as f32 / n_seg as f32) * std::f32::consts::TAU;
+        let p0 = [r * a0.cos(), r * a0.sin(), z];
+        let p1 = [r * a1.cos(), r * a1.sin(), z];
+        // Wind the triangle so the surface normal matches `n_dir`.
+        if outward > 0.0 {
+            push_tri(v, centre, p0, p1, n_dir, n_dir, n_dir, color);
+        } else {
+            push_tri(v, centre, p1, p0, n_dir, n_dir, n_dir, color);
+        }
+    }
+}
+
+/// Sweep an axisymmetric `(z, r)` profile around +Z to produce the holder
+/// silhouette. The profile is in **holder coordinates** (z=0 at the
+/// spindle-nose face). `z_offset` is where the spindle-nose face sits in
+/// tool-local coords — typically the shank top.
+fn holder_swept(v: &mut Vec<Vertex>, profile: &[(f64, f64)], z_offset: f32, color: [f32; 3]) {
+    if profile.len() < 2 { return; }
+    for k in 0..profile.len() - 1 {
+        let (z0, r0) = (profile[k].0 as f32 + z_offset, profile[k].1 as f32);
+        let (z1, r1) = (profile[k+1].0 as f32 + z_offset, profile[k+1].1 as f32);
+        if r0.max(r1) < 0.01 { continue; }
+        cylinder_side(v, z0, z1, r0, r1, color);
+    }
+}
+
+fn push_tri(
+    v: &mut Vec<Vertex>,
+    p0: [f32; 3], p1: [f32; 3], p2: [f32; 3],
+    n0: [f32; 3], n1: [f32; 3], n2: [f32; 3],
+    color: [f32; 3],
+) {
+    v.push(Vertex { position: p0, normal: n0, color });
+    v.push(Vertex { position: p1, normal: n1, color });
+    v.push(Vertex { position: p2, normal: n2, color });
 }

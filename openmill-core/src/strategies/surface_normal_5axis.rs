@@ -49,6 +49,15 @@ pub struct SurfaceNormal5AxisParams {
     /// pushed outward along the surface normal by this amount.
     #[serde(default)]
     pub stock_to_leave: f64,
+    #[serde(default)]
+    pub direction: crate::strategies::CutDirection,
+    #[serde(default)]
+    pub z_range: crate::strategies::ZRange,
+    #[serde(default)]
+    pub spring_pass: crate::strategies::SpringPass,
+    /// Optional cusp height (mm). Overrides `step_over` when set.
+    #[serde(default)]
+    pub step_over_cusp_mm: Option<f64>,
 }
 
 impl Default for SurfaceNormal5AxisParams {
@@ -61,6 +70,10 @@ impl Default for SurfaceNormal5AxisParams {
             tolerance: 0.005,
             pattern: DrivePattern::Parallel,
             stock_to_leave: 0.0,
+            direction: crate::strategies::CutDirection::Climb,
+            z_range: crate::strategies::ZRange::default(),
+            spring_pass: crate::strategies::SpringPass::default(),
+            step_over_cusp_mm: None,
         }
     }
 }
@@ -106,7 +119,11 @@ impl SurfaceNormal5Axis {
     ) -> Result<()> {
         let aabb = &model.aabb;
         let tool_r = tool.shape.diameter() / 2.0;
-        let step_over_mm = tool.shape.diameter() * params.step_over;
+        let step_over_mm = crate::strategies::transforms::step_over_mm_for(
+            params.step_over_cusp_mm,
+            params.step_over,
+            tool,
+        );
         let safe_z = aabb.maxs.z as f64 + 10.0;
         
         let center_x = (aabb.mins.x + aabb.maxs.x) as f64 * 0.5;
@@ -155,7 +172,11 @@ impl SurfaceNormal5Axis {
     ) -> Result<()> {
         let aabb = &model.aabb;
         let tool_r = tool.shape.diameter() / 2.0;
-        let step_over_mm = tool.shape.diameter() * params.step_over;
+        let step_over_mm = crate::strategies::transforms::step_over_mm_for(
+            params.step_over_cusp_mm,
+            params.step_over,
+            tool,
+        );
         let safe_z = aabb.maxs.z as f64 + 10.0;
         
         let center_x = (aabb.mins.x + aabb.maxs.x) as f64 * 0.5;
@@ -208,7 +229,11 @@ impl SurfaceNormal5Axis {
         let mins = aabb.mins;
         let maxs = aabb.maxs;
         let tool_r = tool.shape.diameter() / 2.0;
-        let step_over_mm = tool.shape.diameter() * params.step_over;
+        let step_over_mm = crate::strategies::transforms::step_over_mm_for(
+            params.step_over_cusp_mm,
+            params.step_over,
+            tool,
+        );
 
         let x_min = mins.x as f64;
         let x_max = maxs.x as f64;
@@ -266,7 +291,11 @@ impl SurfaceNormal5Axis {
         let mins = aabb.mins;
         let maxs = aabb.maxs;
         let tool_r = tool.shape.diameter() / 2.0;
-        let step_over_mm = tool.shape.diameter() * params.step_over;
+        let step_over_mm = crate::strategies::transforms::step_over_mm_for(
+            params.step_over_cusp_mm,
+            params.step_over,
+            tool,
+        );
 
         // Rotary scan around the X axis, centred on the model's YZ centroid
         // so the strategy works for parts that aren't placed at the world

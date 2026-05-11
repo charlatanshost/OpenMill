@@ -6,24 +6,36 @@
 
 ## ✨ Key Features
 
-### 🛠️ Toolpath Strategies (12)
+### 🛠️ Toolpath Strategies (13)
 OpenMill ships strategies that scale from 3-axis indexed work to simultaneous 5-axis:
 - **3+2 Indexed**: Lock both rotary axes at fixed angles and run a stock-aware 3-axis raster in the resulting tilted plane.
 - **4+1 Indexed**: Lock A, step C between passes — ideal for wrapping operations around a part or reaching multiple faces in a single setup.
 - **Adaptive Clearing** *(roughing)*: Stock-aware layered raster with engagement-angle-derived step-over.
+- **Simultaneous 5-Axis Roughing** *(roughing)*: Stock-aware layered raster that tilts the tool axis along the local surface normal (capped by a `max_tilt_deg` and an optional `lead_angle`).
 - **Pocket Clearing** *(roughing)*: Bounded raster clear of detected pocket features, layer-by-layer with raycast Z-clamping.
 - **Contour Parallel** *(finishing)*: Z-level waterline that scans from the stock top down through the part.
 - **Surface Normal 5-Axis** *(finishing)*: Parallel / Scallop / Spiral / Rotary patterns with lead-angle and side-tilt control.
 - **Swarf 5-Axis** *(finishing)*: Tool flank aligned with ruled surfaces (turbine vanes, tapered walls).
 - **Geodesic Parallel** *(finishing)*: Surface-aware paths with constant step-over on complex geometry.
 - **5-Axis Pencil Tracing** *(finishing)*: Concave-corner cleanup with bisecting tool tilt.
-- **5-Axis Drilling**: Tool axis automatically aligned to each hole's drill axis.
-- **Tapping**: Rigid-tap cycles with synchronised feed (`feed = rpm × pitch`) and optional pecking.
-- **Thread Milling**: Helical interpolation with climb / conventional toggle and configurable segments per revolution.
+- **5-Axis Drilling**: Tool axis automatically aligned to each hole's drill axis. Picks per-hole canned cycle (Drill `G81`, Counter-bore `G82`, Peck `G83`, Chip-break `G73`, Bore `G85`) with peck depth, dwell, chipbreak retract, and break-through distance.
+- **Tapping**: Rigid (`M29 S<rpm>` on Fanuc/Haas) or floating tap holder, right- or left-hand threads (M3/M4), synchronised feed (`feed = rpm × pitch`), optional pecking.
+- **Thread Milling**: Helical interpolation, internal/external, right- or left-hand, climb/conventional, configurable segments per revolution.
 
 All roughing strategies are **stock-aware** — they plan from the stock envelope (part AABB grown by margin, or cylinder bounds), not just the part shape, so the outer stock margin actually gets cleared.
 
 Every operation carries a **stock-to-leave** value (mm) that's automatically injected into the strategy params at generate time, so you can rough with `0.3 mm` and follow with a finishing op at `0.0` without juggling the same number in two places.
+
+### 🎚️ Cross-cutting strategy controls
+Three knobs that every cutting strategy honours, applied as post-pass transforms by `apply_common_transforms` so you don't have to wire them into each strategy:
+- **Cut Direction** — `Climb` (default), `Conventional` (reverses every cutting block), or `Either` (no change).
+- **Z Range** — optional inclusive top / bottom Z limits. Cutting moves outside the range are dropped; rapids and retracts are kept so the tool can still travel.
+- **Spring pass** — re-cuts the last "pass unit" (suffix from the last rapid through end of toolpath) at a configurable feed fraction (default 0.5×), cleaning up cutter deflection on finishing passes.
+
+Surface strategies (3+2, 4+1, Surface Normal 5-Axis, Geodesic) also accept a **cusp height (mm)** override that derives step-over from the tool's tip radius (`2·√(2Rh − h²)` for ball / bull-nose, with a flat-tool fallback).
+
+### ⬇️ Lead-In / Lead-Out
+Per-operation lead config attaches a `Plunge` / `Ramp` / `Arc` lead-in and matching lead-out to every cutting block. Applied as a post-pass to whatever the strategy emitted, so it works uniformly across all 13 strategies.
 
 ### 🔍 Feature Recognition & Manual Picking
 A first-class **Features** pipeline that turns mesh geometry into op inputs:
@@ -66,24 +78,52 @@ Two distinct viewport modes, switchable from the bottom panel:
 - **Estimated machining time** per operation and a job-wide total, shown in the Operations panel as `Hh Mm Ss`.
 
 ### 📄 Flexible Post-Processing
-- Native support for **LinuxCNC** (RS274NGC) and **GRBL**.
-- **Auto-detected mode**: indexed passes (constant tool axis) emit `G94` feed-per-minute; continuous 5-axis passes emit `G93` inverse-time so all five axes stay synchronised.
-- **Per-operation emission**: spindle on, coolant on, free-form op G-code → toolpath → coolant off (`M9`).
-- **Tool-change safety**: stops spindle (`M5`), stops coolant (`M9`), then `M6 T#` (LinuxCNC) or `M0` pause (GRBL), then runs any tool-level setup G-code.
+- Native support for **LinuxCNC** (RS274NGC), **GRBL**, and **Fanuc** (Fanuc/Haas/Brother family).
+- **Auto-detected mode**: indexed passes (constant tool axis) emit `G94` feed-per-minute; continuous 5-axis passes emit `G93` inverse-time (LinuxCNC) or **TCPM `G43.4`** with tool-axis `I/J/K` words (Fanuc) so all five axes stay synchronised.
+- **Per-operation emission**: spindle on (`M3`/`M4` based on thread hand), coolant on, free-form op G-code → toolpath → coolant off (`M9`).
+- **Rigid tapping**: Fanuc post emits `M29 S<rpm>` ahead of the tapping move when the op selects `Rigid` mode.
+- **Tool-change safety**: stops spindle (`M5`), stops coolant (`M9`), then `M6 T#` (LinuxCNC), `T# M6` + `G43.4 H#` + `M01` operator-verify (Fanuc), or `M0` pause (GRBL); each followed by the tool's own setup G-code.
+- **Sequence numbers** (`N10`, `N20`, …) on every motion block in the Fanuc post for operator hand-edits.
 - **Inverse-time feed near singularities**: rotary-axis velocity clamped to a configurable max so near-vertical-axis moves slow naturally instead of commanding infinite C-axis velocity.
 - **Custom post-processor API** for extending to other controllers via the `PostProcessor` trait.
 
-### 💾 Job Save / Load
-Round-trip a full job (stock, model position, tools, operations, features, machine config) as a single JSON file. Reopen the job later and everything is back: model in the right position, ops in the right order, presets attached.
+### 💾 Save, Load, Bundle, Autosave, Undo
+- **Job JSON** — round-trip the entire job (stock, model position, tools, operations, features, machine config) as a single file. Existing JSON files keep loading when new fields are added because every persisted field is `#[serde(default)]`.
+- **`.omp` project bundle** — single-file ZIP containing the job, the imported mesh, every tool, and the chosen machine config. Drop the file anywhere and reopen.
+- **Autosave** — periodic write to `<job>.autosave.json` so a crash or hang doesn't lose work; offers to recover on the next launch.
+- **Undo / Redo** — `Ctrl+Z` / `Ctrl+Y` over the live job state.
+- **Setup sheet** — HTML report (model preview, ops table, tools, machining time estimate) generated from any job for shop-floor handoff.
 
 ## 🏗️ Architecture
 
 | Crate | Responsibility |
 |---|---|
-| [`openmill-core`](./openmill-core) | Geometry, kinematics, model + stock + position, **strategies**, **features**, **verifier**, toolpath types. |
-| [`openmill-sim`](./openmill-sim) | Material-removal simulation primitives. |
-| [`openmill-post`](./openmill-post) | G-code dialects (LinuxCNC, GRBL), inverse-time feed math, per-op preamble/postamble. |
-| [`openmill-ui`](./openmill-ui) | Desktop GUI built with `egui` + `wgpu`; voxel carving & raymarched stock rendering, ghost-mesh X-ray, click-to-pick. |
+| [`openmill-core`](./openmill-core) | Geometry, kinematics (`TableTable` IK), model + stock + position, **strategies** (incl. cross-cutting transforms), **features**, **verifier**, **SDF** (deviation-to-target), toolpath types + leads. |
+| [`openmill-sim`](./openmill-sim) | Material-removal simulation primitives, full-body tool + holder collision checker (`parry3d`). |
+| [`openmill-post`](./openmill-post) | G-code dialects (LinuxCNC, GRBL, Fanuc), inverse-time feed math, TCPM, per-op preamble/postamble. |
+| [`openmill-ui`](./openmill-ui) | Desktop GUI built with `egui` + `wgpu`; GPU voxel carving + GPU Marching-Cubes iso-surface, ghost-mesh X-ray, click-to-pick, background generation worker, undo/redo, autosave, `.omp` bundles, HTML setup sheets. |
+
+### Source layout (where to add things)
+```
+openmill-core/src/
+  strategies/          one .rs file per strategy + transforms.rs (cross-cutting params)
+  toolpath/            ToolpathPoint, MoveType, LeadConfig
+  kinematics.rs        table-table IK and machine config
+  feature.rs           hole / pocket / face detectors
+  verify.rs            pre-export checks
+  sdf.rs               deviation-to-target field
+openmill-post/src/
+  traits.rs            PostProcessor trait + shared helpers (spindle direction)
+  linuxcnc.rs, grbl.rs, fanuc.rs    one file per dialect
+openmill-ui/src/
+  app/                 top-level UI split across menu, sidebar, panels, tabs, strategy_params
+  generate.rs          background generation worker + dispatch
+  history.rs           undo/redo stack
+  autosave.rs, bundle.rs, setup_sheet.rs
+  voxel.rs, marching_cubes.rs, viewport.rs    wgpu rendering
+```
+
+Full developer extension guide is in [CONTRIBUTING.md](./CONTRIBUTING.md) and [GUIDE.md §11](./GUIDE.md).
 
 ## 🚀 Getting Started
 

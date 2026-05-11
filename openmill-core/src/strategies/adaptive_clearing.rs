@@ -35,6 +35,17 @@ pub struct AdaptiveClearingParams {
     /// far above the actual mesh so a finishing op can skim down to size.
     #[serde(default)]
     pub stock_to_leave: f64,
+    /// Cut direction. `Climb` (default) emits the strategy's native
+    /// direction; `Conventional` reverses every cutting block as a
+    /// post-pass.
+    #[serde(default)]
+    pub direction: crate::strategies::CutDirection,
+    /// Optional top / bottom Z limits. Cutting points outside the range
+    /// are dropped at post-pass time.
+    #[serde(default)]
+    pub z_range: crate::strategies::ZRange,
+    #[serde(default)]
+    pub spring_pass: crate::strategies::SpringPass,
 }
 
 impl Default for AdaptiveClearingParams {
@@ -44,6 +55,9 @@ impl Default for AdaptiveClearingParams {
             step_down: 2.0,
             feed_rate: 800.0,
             stock_to_leave: 0.0,
+            direction: crate::strategies::CutDirection::Climb,
+            z_range: crate::strategies::ZRange::default(),
+            spring_pass: crate::strategies::SpringPass::default(),
         }
     }
 }

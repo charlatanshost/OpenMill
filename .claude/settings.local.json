@@ -4,7 +4,17 @@
       "Bash(cargo build *)",
       "Read(//c/Users/danie/.claude/projects/c--Users-danie-Downloads-OpenMill/**)",
       "Read(//c/Users/danie/.claude/projects/**)",
-      "Bash(cargo test *)"
+      "Bash(cargo test *)",
+      "Bash(git stash *)",
+      "Bash(git mv *)",
+      "Bash(head -2920 openmill-ui/src/app/mod.rs)",
+      "Bash(mv /tmp/mod_head.rs openmill-ui/src/app/mod.rs)",
+      "Bash(sed -n '2609,2920p' openmill-ui/src/app/mod.rs)",
+      "Read(//tmp/**)",
+      "Bash(head -2611 openmill-ui/src/app/mod.rs)",
+      "Bash(tail -n +2924 openmill-ui/src/app/mod.rs)",
+      "Bash(sed -n '2608,2615p' openmill-ui/src/app/mod.rs)",
+      "Bash(grep -E \"^[a-z_]{3,}$\")"
     ]
   }
 }

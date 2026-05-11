@@ -136,20 +136,33 @@ impl ToolpathStrategy for Swarf5Axis {
 
         for pass in 1..=num_axial_passes {
             let t_axial = pass as f64 / num_axial_passes as f64;
-            
+
+            // Compute the start position of this pass (first ruling at the
+            // interpolated axial height) so we can rapid-over to it at
+            // safe-Z before the first cut. Without this the LeadIn would
+            // fly diagonally from safe-Z straight into the wall mid-height.
+            let (top0, bot0) = rulings[0];
+            let start_pos = bot0.coords.lerp(&top0.coords, 1.0 - t_axial);
+            tp.points.push(ToolpathPoint {
+                position: Point3::new(start_pos.x, start_pos.y, safe_z),
+                orientation: Vector3::z_axis(),
+                feed_rate: 0.0,
+                move_type: MoveType::Rapid,
+            });
+
             for (idx, (top, bot)) in rulings.iter().enumerate() {
                 let tool_axis = Unit::new_normalize(top - bot);
                 // The tool tip position for a flank cut is interpolated along the ruling
                 let pos = bot.coords.lerp(&top.coords, 1.0 - t_axial);
-                
+
                 tp.points.push(ToolpathPoint {
                     position: Point3::from(pos),
                     orientation: tool_axis,
-                    feed_rate: params.feed_rate,
+                    feed_rate: if idx == 0 { params.feed_rate * 0.5 } else { params.feed_rate },
                     move_type: if idx == 0 { MoveType::LeadIn } else { MoveType::Linear },
                 });
             }
-            
+
             // Retract if there are more passes
             if pass < num_axial_passes {
                 let last = tp.points.last().unwrap().position;
@@ -174,3 +187,74 @@ impl ToolpathStrategy for Swarf5Axis {
         Ok(vec![tp])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{StockShape, WorkpieceModel};
+    use parry3d::math::Point as PPoint;
+    use parry3d::shape::TriMesh;
+
+    /// A simple closed wall — four-sided pyramid trunk so the swarf
+    /// raycaster finds rulings all around.
+    fn wall_model() -> WorkpieceModel {
+        let verts = vec![
+            PPoint::new(-5.0, -5.0, 0.0), PPoint::new( 5.0, -5.0, 0.0),
+            PPoint::new( 5.0,  5.0, 0.0), PPoint::new(-5.0,  5.0, 0.0),
+            PPoint::new(-5.0, -5.0, 10.0), PPoint::new( 5.0, -5.0, 10.0),
+            PPoint::new( 5.0,  5.0, 10.0), PPoint::new(-5.0,  5.0, 10.0),
+        ];
+        let tris = vec![
+            [0u32, 1, 5], [0, 5, 4],
+            [1, 2, 6], [1, 6, 5],
+            [2, 3, 7], [2, 7, 6],
+            [3, 0, 4], [3, 4, 7],
+        ];
+        WorkpieceModel::new(
+            TriMesh::new(verts, tris),
+            StockShape::BoundingBox {
+                margin: nalgebra::Vector3::new(2.0, 2.0, 2.0),
+            },
+        )
+    }
+
+    #[test]
+    fn between_pass_first_move_is_rapid_at_safe_z() {
+        // Regression: multi-axial-pass swarf used to start each new pass
+        // with a LeadIn directly from safe-Z to a mid-height point on the
+        // wall, slicing diagonally through the part.
+        let model = wall_model();
+        let tool = crate::tool::Tool::flat_end(1, "6mm flat", 6.0, 20.0);
+        let machine = crate::kinematics::default_machines::default_trunnion_config();
+        let params = Swarf5AxisParams {
+            z_top: 10.0, z_bottom: 0.0,
+            num_passes: 1, step_down: 2.5, // forces 4 axial passes
+            feed_rate: 500.0,
+            overhang_compensation: false,
+        };
+        let paths = Swarf5Axis.generate(&model, &tool, &machine, &params).unwrap();
+        assert!(!paths.is_empty());
+        let tp = &paths[0];
+        let safe_z = params.z_top.max(params.z_bottom) + 10.0;
+
+        // After every Retract there must be either end-of-toolpath or a
+        // Rapid (not a LeadIn) at safe_z.
+        for i in 0..tp.points.len().saturating_sub(1) {
+            if tp.points[i].move_type == MoveType::Retract {
+                let next = &tp.points[i + 1];
+                assert!(
+                    next.move_type == MoveType::Rapid,
+                    "expected Rapid after Retract, got {:?} (regression: \
+                     bare LeadIn would slice into the wall)",
+                    next.move_type,
+                );
+                assert!(
+                    (next.position.z - safe_z).abs() < 1e-6,
+                    "the linking Rapid should sit at safe_z={safe_z}, got {}",
+                    next.position.z,
+                );
+            }
+        }
+    }
+}
+

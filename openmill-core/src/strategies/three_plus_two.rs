@@ -34,6 +34,16 @@ pub struct ThreePlusTwoParams {
     /// Stock to leave on the part surface [mm].
     #[serde(default)]
     pub stock_to_leave: f64,
+    #[serde(default)]
+    pub direction: crate::strategies::CutDirection,
+    #[serde(default)]
+    pub z_range: crate::strategies::ZRange,
+    #[serde(default)]
+    pub spring_pass: crate::strategies::SpringPass,
+    /// Optional cusp height (mm). When `Some`, overrides `step_over` and
+    /// derives the actual lateral step from the tool's tip radius.
+    #[serde(default)]
+    pub step_over_cusp_mm: Option<f64>,
 }
 
 impl Default for ThreePlusTwoParams {
@@ -45,6 +55,10 @@ impl Default for ThreePlusTwoParams {
             step_over: 0.5,
             feed_rate: 700.0,
             stock_to_leave: 0.0,
+            direction: crate::strategies::CutDirection::Climb,
+            z_range: crate::strategies::ZRange::default(),
+            spring_pass: crate::strategies::SpringPass::default(),
+            step_over_cusp_mm: None,
         }
     }
 }
@@ -124,7 +138,11 @@ impl ToolpathStrategy for ThreePlusTwo {
         }
 
         let tool_r = tool.shape.diameter() / 2.0;
-        let step_over_mm = tool.shape.diameter() * params.step_over;
+        let step_over_mm = crate::strategies::transforms::step_over_mm_for(
+            params.step_over_cusp_mm,
+            params.step_over,
+            tool,
+        );
 
         let lx_min = local_mins.x + tool_r;
         let lx_max = local_maxs.x - tool_r;

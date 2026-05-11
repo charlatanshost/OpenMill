@@ -11,7 +11,7 @@ use openmill_core::{
 };
 
 use crate::feed_rate::{compute_inverse_time_feed_with_kin, joints_for_point};
-use crate::traits::PostProcessor;
+use crate::traits::{spindle_command_for, PostProcessor};
 
 /// GRBL post-processor.
 pub struct GrblPost;
@@ -126,7 +126,7 @@ impl PostProcessor for GrblPost {
         let mut s = String::new();
         s.push_str(&format!("({})\n", op.name));
         if op.spindle_speed > 0.0 {
-            s.push_str(&format!("M3 S{:.0}\n", op.spindle_speed));
+            s.push_str(&format!("{} S{:.0}\n", spindle_command_for(op), op.spindle_speed));
         }
         if let Some(code) = op.coolant.gcode_on() {
             s.push_str(code);

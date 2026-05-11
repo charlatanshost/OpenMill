@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::fixture::Fixture;
 use crate::kinematics::MachineConfig;
 use crate::tool::{Coolant, Tool};
+use crate::toolpath::LeadConfig;
 
 
 /// Top-level project container holding everything needed to machine a part.
@@ -114,6 +115,11 @@ pub struct Operation {
     /// `stock_to_leave` parameter (when the strategy honours it).
     #[serde(default)]
     pub stock_to_leave: f64,
+    /// Lead-in / lead-out shaping applied as a post-pass to the generated
+    /// toolpath. Default `LeadKind::None` keeps the strategy's plunge
+    /// entry, so existing jobs round-trip unchanged.
+    #[serde(default)]
+    pub leads: LeadConfig,
     /// Whether this operation is enabled.
     pub enabled: bool,
 }

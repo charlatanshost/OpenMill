@@ -1,4 +1,10 @@
 mod app;
+mod autosave;
+mod bundle;
+mod generate;
+mod history;
+mod marching_cubes;
+mod setup_sheet;
 mod viewport;
 mod voxel;
 

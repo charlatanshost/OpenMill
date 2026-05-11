@@ -41,7 +41,19 @@ pub struct ThreadMillingParams {
     pub climb: bool,
     /// Number of straight-line segments per helix revolution.
     pub segments_per_rev: usize,
+    /// Thread hand. Combined with `internal` it determines the helix
+    /// winding direction; with `climb` it determines whether the cut
+    /// runs climbing or conventional.
+    #[serde(default)]
+    pub thread_direction: crate::strategies::ThreadDirection,
+    /// Internal thread (`true`, default — threading inside a bore) vs
+    /// external (`false` — threading the outside of a stud / boss).
+    /// Flips the helix radius offset relative to the tool axis.
+    #[serde(default = "default_internal")]
+    pub internal: bool,
 }
+
+fn default_internal() -> bool { true }
 
 impl Default for ThreadMillingParams {
     fn default() -> Self {
@@ -53,6 +65,8 @@ impl Default for ThreadMillingParams {
             feed_rate: 300.0,
             climb: true,
             segments_per_rev: 36, // 10° per segment
+            thread_direction: crate::strategies::ThreadDirection::RightHand,
+            internal: true,
         }
     }
 }

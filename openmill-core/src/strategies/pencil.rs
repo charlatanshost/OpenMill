@@ -21,6 +21,12 @@ pub struct PencilParams {
     pub threshold_deg: f64,
     /// Cutting feed rate [mm/min].
     pub feed_rate: f64,
+    #[serde(default)]
+    pub direction: crate::strategies::CutDirection,
+    #[serde(default)]
+    pub z_range: crate::strategies::ZRange,
+    #[serde(default)]
+    pub spring_pass: crate::strategies::SpringPass,
 }
 
 impl Default for PencilParams {
@@ -28,6 +34,9 @@ impl Default for PencilParams {
         PencilParams {
             threshold_deg: 30.0,
             feed_rate: 300.0,
+            direction: crate::strategies::CutDirection::Climb,
+            z_range: crate::strategies::ZRange::default(),
+            spring_pass: crate::strategies::SpringPass::default(),
         }
     }
 }
@@ -106,11 +115,22 @@ impl ToolpathStrategy for PencilTracing {
                     let offset_p1 = p1 + orient.into_inner() * tool_r;
                     let offset_p2 = p2 + orient.into_inner() * tool_r;
 
+                    // Rapid to safe-Z above the edge start, plunge in as a
+                    // slow LeadIn, cut the edge, retract to safe Z. Without
+                    // the horizontal-only rapid the tool would fly diagonally
+                    // from the previous retract straight to a point on the
+                    // part surface — i.e. through the model.
                     tp.points.push(ToolpathPoint {
-                        position: offset_p1,
+                        position: Point3::new(offset_p1.x, offset_p1.y, safe_z),
                         orientation: orient,
                         feed_rate: 0.0,
                         move_type: MoveType::Rapid,
+                    });
+                    tp.points.push(ToolpathPoint {
+                        position: offset_p1,
+                        orientation: orient,
+                        feed_rate: params.feed_rate * 0.5,
+                        move_type: MoveType::LeadIn,
                     });
                     tp.points.push(ToolpathPoint {
                         position: offset_p2,
@@ -124,5 +144,65 @@ impl ToolpathStrategy for PencilTracing {
         }
 
         Ok(vec![tp])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{StockShape, WorkpieceModel};
+    use parry3d::math::Point as PPoint;
+    use parry3d::shape::TriMesh;
+
+    /// A 90° concave corner: two triangles meeting along a sharp edge so the
+    /// pencil strategy finds at least one edge to trace.
+    fn concave_corner_model() -> WorkpieceModel {
+        // Two right-angle walls sharing an edge along Y = 0.
+        let verts = vec![
+            PPoint::new(0.0, 0.0, 0.0),
+            PPoint::new(10.0, 0.0, 0.0),
+            PPoint::new(0.0, 0.0, 10.0),
+            PPoint::new(10.0, 0.0, 10.0),
+            PPoint::new(0.0, 10.0, 0.0),
+            PPoint::new(10.0, 10.0, 0.0),
+        ];
+        let tris = vec![
+            [0u32, 1, 2], [1, 3, 2],
+            [0, 4, 1], [1, 4, 5],
+        ];
+        WorkpieceModel::new(
+            TriMesh::new(verts, tris),
+            StockShape::BoundingBox {
+                margin: nalgebra::Vector3::new(2.0, 2.0, 2.0),
+            },
+        )
+    }
+
+    #[test]
+    fn every_rapid_starts_at_safe_z() {
+        // Regression: pencil used to emit Rapid moves that landed directly
+        // ON the part surface, so the tool would fly diagonally through the
+        // model from one edge to the next.
+        let model = concave_corner_model();
+        let tool = Tool::ball_end(1, "3mm ball", 3.0, 20.0);
+        let machine = crate::kinematics::default_machines::default_trunnion_config();
+        let params = PencilParams::default();
+
+        let paths = PencilTracing.generate(&model, &tool, &machine, &params).unwrap();
+        assert!(!paths.is_empty(), "expected at least one toolpath");
+        let safe_z = model.aabb.maxs.z as f64 + 10.0;
+        for tp in &paths {
+            for pt in &tp.points {
+                if pt.move_type == MoveType::Rapid {
+                    assert!(
+                        (pt.position.z - safe_z).abs() < 1e-6,
+                        "Rapid landed at z={}, expected safe_z={}: bug regression — \
+                         rapid is supposed to clear the part",
+                        pt.position.z,
+                        safe_z,
+                    );
+                }
+            }
+        }
     }
 }

@@ -161,6 +161,110 @@ impl Toolpath {
             acc + dist / rate
         })
     }
+
+    /// Compute cut/rapid distance and time split.
+    ///
+    /// Lead-in/lead-out segments count as cutting (the cutter is engaged or
+    /// approaching engagement). Rapid + Retract count as rapids.
+    pub fn metrics(&self, rapid_mm_per_min: f64) -> ToolpathMetrics {
+        let mut m = ToolpathMetrics::default();
+        for w in self.points.windows(2) {
+            let dist = w[0].distance_to(&w[1]);
+            match w[1].move_type {
+                MoveType::Rapid | MoveType::Retract => {
+                    m.rapid_distance_mm += dist;
+                    m.rapid_minutes += dist / rapid_mm_per_min.max(1.0);
+                }
+                _ => {
+                    m.cut_distance_mm += dist;
+                    m.cut_minutes += dist / w[1].feed_rate.max(1.0);
+                }
+            }
+        }
+        m.point_count = self.points.len();
+        m
+    }
+
+    /// Length of `Linear` / `LeadIn` / `LeadOut` segments whose endpoints
+    /// both sit outside the supplied stock envelope. The classification
+    /// matches the viewport's air-cut shading, so the reported figure is
+    /// the distance the user sees rendered dimly.
+    ///
+    /// `tool_radius_mm` widens the XY footprint to account for the
+    /// cutter's radial extent. A `None` envelope returns 0 — no envelope,
+    /// no flag.
+    pub fn air_cut_distance(
+        &self,
+        stock_aabb: Option<&parry3d::bounding_volume::Aabb>,
+        tool_radius_mm: f64,
+    ) -> f64 {
+        let Some(aabb) = stock_aabb else { return 0.0 };
+        let r = tool_radius_mm.max(0.0) as f32;
+        let in_stock = |p: &nalgebra::Point3<f64>| {
+            let px = p.x as f32;
+            let py = p.y as f32;
+            let pz = p.z as f32;
+            pz <= aabb.maxs.z + 1e-3
+                && px >= aabb.mins.x - r
+                && px <= aabb.maxs.x + r
+                && py >= aabb.mins.y - r
+                && py <= aabb.maxs.y + r
+        };
+        let mut total = 0.0;
+        for w in self.points.windows(2) {
+            let is_cut = matches!(
+                w[1].move_type,
+                MoveType::Linear | MoveType::LeadIn | MoveType::LeadOut
+            );
+            if !is_cut { continue; }
+            if !in_stock(&w[0].position) && !in_stock(&w[1].position) {
+                total += w[0].distance_to(&w[1]);
+            }
+        }
+        total
+    }
+}
+
+// ── Cycle-time + distance metrics ───────────────────────────────────────────
+
+/// Summary of cut/rapid distance + time for one or more toolpaths.
+///
+/// All distances in mm, all times in minutes. Excludes acceleration, dwell,
+/// tool-change time, and any non-motion controller overhead — it's a
+/// programmer's estimate, not a controller-accurate dispatch time.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ToolpathMetrics {
+    pub cut_distance_mm: f64,
+    pub rapid_distance_mm: f64,
+    pub cut_minutes: f64,
+    pub rapid_minutes: f64,
+    pub point_count: usize,
+}
+
+impl ToolpathMetrics {
+    pub fn total_distance_mm(&self) -> f64 {
+        self.cut_distance_mm + self.rapid_distance_mm
+    }
+    pub fn total_minutes(&self) -> f64 {
+        self.cut_minutes + self.rapid_minutes
+    }
+    pub fn merge(&mut self, other: &ToolpathMetrics) {
+        self.cut_distance_mm += other.cut_distance_mm;
+        self.rapid_distance_mm += other.rapid_distance_mm;
+        self.cut_minutes += other.cut_minutes;
+        self.rapid_minutes += other.rapid_minutes;
+        self.point_count += other.point_count;
+    }
+}
+
+/// Aggregate metrics across a slice of toolpaths.
+pub fn aggregate_metrics(paths: &[Toolpath], rapid_mm_per_min: f64) -> ToolpathMetrics {
+    let mut acc = ToolpathMetrics::default();
+    for p in paths {
+        let m = p.metrics(rapid_mm_per_min);
+        acc.merge(&m);
+    }
+    acc
 }
 
 #[cfg(test)]

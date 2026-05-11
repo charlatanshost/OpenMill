@@ -31,15 +31,17 @@ const DEGENERATE_THRESHOLD: f32 = 1e-10;
 pub fn import_3mf(path: &Path) -> Result<WorkpieceModel> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("Cannot open 3MF: {}", path.display()))?;
+    import_3mf_reader(file)
+        .with_context(|| format!("Failed to parse 3MF: {}", path.display()))
+}
 
-    let mut archive = zip::ZipArchive::new(file)
-        .with_context(|| format!("'{}' is not a valid ZIP/3MF archive", path.display()))?;
-
-    let xml_bytes = find_model_xml(&mut archive)
-        .with_context(|| format!("No .model XML found in '{}'", path.display()))?;
-
-    build_from_xml(&xml_bytes)
-        .with_context(|| format!("Failed to parse 3MF mesh XML from '{}'", path.display()))
+/// Import 3MF from any `Read + Seek` source. Useful for in-memory buffers
+/// (e.g. when reading a model embedded in an `.omp` project bundle).
+pub fn import_3mf_reader<R: Read + Seek>(reader: R) -> Result<WorkpieceModel> {
+    let mut archive = zip::ZipArchive::new(reader)
+        .context("not a valid ZIP/3MF archive")?;
+    let xml_bytes = find_model_xml(&mut archive).context("no .model XML found")?;
+    build_from_xml(&xml_bytes).context("3MF mesh XML parse failed")
 }
 
 // ── ZIP extraction ────────────────────────────────────────────────────────────

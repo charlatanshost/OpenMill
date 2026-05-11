@@ -28,6 +28,12 @@ pub struct ContourParallelParams {
     /// is pushed outward by this amount so the cut stays clear of the part.
     #[serde(default)]
     pub stock_to_leave: f64,
+    #[serde(default)]
+    pub direction: crate::strategies::CutDirection,
+    #[serde(default)]
+    pub z_range: crate::strategies::ZRange,
+    #[serde(default)]
+    pub spring_pass: crate::strategies::SpringPass,
 }
 
 impl Default for ContourParallelParams {
@@ -37,6 +43,9 @@ impl Default for ContourParallelParams {
             feed_rate: 600.0,
             tolerance: 0.01,
             stock_to_leave: 0.0,
+            direction: crate::strategies::CutDirection::Climb,
+            z_range: crate::strategies::ZRange::default(),
+            spring_pass: crate::strategies::SpringPass::default(),
         }
     }
 }

@@ -15,7 +15,7 @@ use openmill_core::{
 };
 
 use crate::feed_rate::{compute_inverse_time_feed_with_kin, joints_for_point};
-use crate::traits::PostProcessor;
+use crate::traits::{spindle_command_for, PostProcessor};
 
 /// LinuxCNC post-processor.
 pub struct LinuxCncPost;
@@ -149,7 +149,7 @@ impl PostProcessor for LinuxCncPost {
         let mut s = String::new();
         s.push_str(&format!("(--- Op: {}) \n", op.name));
         if op.spindle_speed > 0.0 {
-            s.push_str(&format!("M3 S{:.0}\n", op.spindle_speed));
+            s.push_str(&format!("{} S{:.0}\n", spindle_command_for(op), op.spindle_speed));
         }
         if let Some(code) = op.coolant.gcode_on() {
             s.push_str(code);
@@ -303,6 +303,7 @@ mod tests {
             coolant: openmill_core::Coolant::Flood,
             gcode_command: "G43 H1".into(),
             stock_to_leave: 0.0,
+            leads: openmill_core::LeadConfig::default(),
             enabled: true,
         };
         let pre = post.op_preamble(&op, &tool);

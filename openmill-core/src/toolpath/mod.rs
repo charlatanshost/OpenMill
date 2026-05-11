@@ -1,3 +1,7 @@
+pub mod leads;
 mod types;
 
-pub use types::{MoveType, OperationType, Toolpath, ToolpathPoint};
+pub use leads::{apply_leads, LeadConfig, LeadKind};
+pub use types::{
+    aggregate_metrics, MoveType, OperationType, Toolpath, ToolpathMetrics, ToolpathPoint,
+};

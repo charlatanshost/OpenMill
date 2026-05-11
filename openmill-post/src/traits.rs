@@ -1,6 +1,24 @@
 use anyhow::Result;
 use openmill_core::{MachineConfig, Operation, PostConfig, Tool, Toolpath};
 
+/// Spindle command (`"M3"` clockwise or `"M4"` counter-clockwise) for an
+/// op. Threading strategies expose a `thread_direction` field in their
+/// params JSON; left-hand threads need M4 so the tap or thread mill
+/// winds out cleanly. Every other strategy defaults to M3.
+pub fn spindle_command_for(op: &Operation) -> &'static str {
+    let is_threading = matches!(op.strategy.as_str(), "Tapping" | "Thread Milling");
+    let left_hand = op
+        .params
+        .get("thread_direction")
+        .and_then(|v| v.as_str())
+        == Some("left_hand");
+    if is_threading && left_hand {
+        "M4"
+    } else {
+        "M3"
+    }
+}
+
 // ── PostProcessor trait ──────────────────────────────────────────────────────
 
 /// Trait implemented by each G-code dialect (LinuxCNC, GRBL, etc.).

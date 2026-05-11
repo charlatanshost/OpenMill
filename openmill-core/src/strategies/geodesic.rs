@@ -25,6 +25,16 @@ pub struct GeodesicParams {
     pub feed_rate: f64,
     /// Surface chord tolerance [mm].
     pub tolerance: f64,
+    #[serde(default)]
+    pub direction: crate::strategies::CutDirection,
+    #[serde(default)]
+    pub z_range: crate::strategies::ZRange,
+    #[serde(default)]
+    pub spring_pass: crate::strategies::SpringPass,
+    /// Optional cusp height (mm). Overrides `step_over` when set; the
+    /// helper converts via the tool's tip radius.
+    #[serde(default)]
+    pub step_over_cusp_mm: Option<f64>,
 }
 
 impl Default for GeodesicParams {
@@ -33,6 +43,10 @@ impl Default for GeodesicParams {
             step_over: 0.5,
             feed_rate: 400.0,
             tolerance: 0.01,
+            direction: crate::strategies::CutDirection::Climb,
+            z_range: crate::strategies::ZRange::default(),
+            spring_pass: crate::strategies::SpringPass::default(),
+            step_over_cusp_mm: None,
         }
     }
 }
@@ -59,6 +73,20 @@ impl ToolpathStrategy for GeodesicParallel {
         let aabb = &model.aabb;
         let tool_r = tool.shape.diameter() / 2.0;
         let safe_z = aabb.maxs.z as f64 + 10.0;
+
+        // Geodesic's `step_over` is a literal mm decrement (not a fraction).
+        // When the user supplies a cusp height we derive the same mm value
+        // from the tool's tip radius; otherwise fall back to `step_over`
+        // directly. Helper expects a "fraction" so we feed it a synthetic
+        // fraction that makes `fraction * diameter == step_over`.
+        let synthetic_fraction = if tool.shape.diameter() > 0.0 {
+            params.step_over / tool.shape.diameter()
+        } else { 1.0 };
+        let z_step = crate::strategies::transforms::step_over_mm_for(
+            params.step_over_cusp_mm,
+            synthetic_fraction,
+            tool,
+        ).max(0.05);
 
         let z_min = aabb.mins.z as f64;
         let z_max = aabb.maxs.z as f64;
@@ -112,7 +140,7 @@ impl ToolpathStrategy for GeodesicParallel {
                 tp.points.push(ToolpathPoint::retract(Point3::new(last.x, last.y, safe_z)));
             }
 
-            z -= params.step_over;
+            z -= z_step;
         }
 
         Ok(vec![tp])

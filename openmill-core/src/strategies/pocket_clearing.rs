@@ -38,6 +38,12 @@ pub struct PocketClearingParams {
     /// Margin to leave around the floor and walls [mm] (positive = leave more
     /// stock for a finishing pass).
     pub stock_to_leave: f64,
+    #[serde(default)]
+    pub direction: crate::strategies::CutDirection,
+    #[serde(default)]
+    pub z_range: crate::strategies::ZRange,
+    #[serde(default)]
+    pub spring_pass: crate::strategies::SpringPass,
 }
 
 /// Snapshot of a pocket feature embedded in the op params so the op can be
@@ -58,6 +64,9 @@ impl Default for PocketClearingParams {
             step_over: 0.5,
             feed_rate: 800.0,
             stock_to_leave: 0.0,
+            direction: crate::strategies::CutDirection::Climb,
+            z_range: crate::strategies::ZRange::default(),
+            spring_pass: crate::strategies::SpringPass::default(),
         }
     }
 }
@@ -221,6 +230,9 @@ mod tests {
             step_over: 0.5,
             feed_rate: 600.0,
             stock_to_leave: 0.0,
+            direction: crate::strategies::CutDirection::Climb,
+            z_range: crate::strategies::ZRange::default(),
+            spring_pass: crate::strategies::SpringPass::default(),
         };
         let tool = Tool::flat_end(1, "6mm flat", 6.0, 20.0);
         let machine = crate::kinematics::default_machines::default_trunnion_config();

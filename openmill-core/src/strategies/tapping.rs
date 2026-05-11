@@ -35,6 +35,15 @@ pub struct TappingParams {
     pub peck_depth: f64,
     /// Dwell at the bottom of each hole [s] before reversing.
     pub dwell: f64,
+    /// Thread hand. Posts flip the spindle direction (M3 vs M4) and
+    /// retract direction so the tap unthreads cleanly.
+    #[serde(default)]
+    pub thread_direction: crate::strategies::ThreadDirection,
+    /// Rigid (`M29 S<rpm>` on Fanuc/Haas) vs floating-tap-holder mode.
+    /// Rigid requires the controller to synchronise spindle rotation
+    /// with Z feed.
+    #[serde(default)]
+    pub tap_mode: crate::strategies::TapMode,
 }
 
 impl Default for TappingParams {
@@ -45,6 +54,8 @@ impl Default for TappingParams {
             spindle_rpm: 600.0,
             peck_depth: 0.0,
             dwell: 0.0,
+            thread_direction: crate::strategies::ThreadDirection::RightHand,
+            tap_mode: crate::strategies::TapMode::Rigid,
         }
     }
 }

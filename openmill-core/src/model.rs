@@ -30,6 +30,7 @@ pub enum StockShape {
 /// `stock` describes what material we start from. Stock is always derived
 /// from the part AABB (grown by margin or wrapped by a cylinder) so it
 /// follows the part automatically when `position` changes.
+#[derive(Clone)]
 pub struct WorkpieceModel {
     /// Triangulated mesh of the finished part **with `position` baked in**
     /// (parry3d f32 precision).
